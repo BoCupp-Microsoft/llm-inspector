@@ -67,6 +67,7 @@ body {
 
 /* Completeness warning */
 .warn-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: #5a3a00; color: #ffcf6b; white-space: nowrap; }
+.sub-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: #1f3a4d; color: #7fd0ff; white-space: nowrap; }
 .row-warn { color: #ffcf6b; font-size: 11px; margin-top: 3px; line-height: 1.35; white-space: normal; }
 
 /* Context kinds */

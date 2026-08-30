@@ -23,9 +23,14 @@ export function SessionList({
           const title = s.summary || s.repository || s.session_id.slice(0, 8);
           const v = s.verification;
           const missing = v?.missing ?? 0;
+          const subAgents = v?.subAgents ?? 0;
           const warn =
             missing > 0
               ? `Copilot recorded ${v?.expected} model call(s); only ${v?.capturedAgent} captured — ${missing} not shown. Capture may be incomplete.`
+              : '';
+          const subInfo =
+            subAgents > 0
+              ? `Copilot spawned ${subAgents} sub-agent(s) this session. Their turns are included in the merged Main agent timeline (the wire has no signal to separate them).`
               : '';
           return (
             <button
@@ -37,6 +42,9 @@ export function SessionList({
                 <span className="title" title={s.session_id}>{title}</span>
                 {missing > 0 && (
                   <span className="warn-badge" title={warn}>⚠ {missing} missing</span>
+                )}
+                {subAgents > 0 && (
+                  <span className="sub-badge" title={subInfo}>⛓ {subAgents} sub</span>
                 )}
                 <span className={`status status-${s.status || 'unknown'}`}>{s.status || '—'}</span>
               </div>

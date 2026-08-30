@@ -125,6 +125,107 @@ export class Db {
     }
   }
 
+  // Distinct *real* sub-agent ids for a session, straight from the Copilot store. The store's
+  // assistant_usage_events.agent_id is null for the main agent and non-null only for sub-agents
+  // spawned via the Task tool, so this is the authoritative count. Returns null when the store is
+  // unavailable (caller treats unknown as "no sub-agents" rather than inventing any).
+  storeSubAgentIds(sessionId) {
+    this.openStore();
+    if (!this.store) return null;
+    try {
+      const rows = this.store
+        .prepare(
+          `SELECT DISTINCT agent_id FROM assistant_usage_events
+           WHERE session_id = ? AND agent_id IS NOT NULL`
+        )
+        .all(sessionId);
+      return rows.map((r) => r.agent_id);
+    } catch {
+      return null;
+    }
+  }
+
+  // Group captured contexts into display units driven by the store's ground truth. The x-agent-task-id
+  // header (our thread_key) rotates within a single main agent -- each new user prompt after the agent
+  // goes idle, and each compaction, starts a fresh task id -- so distinct capture "contexts" are NOT
+  // distinct agents. The only authoritative sub-agent signal is a non-null store agent_id. When there
+  // are no real sub-agents we merge every conversational thread into one "Main agent" unit so the
+  // viewer matches what actually ran in the CLI (one continuous main context), keeping background
+  // title/summary calls separate.
+  contextGroups(sessionId) {
+    const rows = this.db
+      .prepare(
+        `SELECT c.context_id, c.agent_id, c.first_seen_at,
+                (SELECT COUNT(*) FROM turns t WHERE t.context_id = c.context_id) AS turn_count,
+                (SELECT COUNT(*) FROM turns t WHERE t.context_id = c.context_id
+                   AND IFNULL(json_extract(t.request_headers_json,'$."x-interaction-type"'),'')
+                       LIKE '%background%') AS background_turns,
+                (SELECT MIN(t.captured_at) FROM turns t WHERE t.context_id = c.context_id) AS min_at,
+                (SELECT json_extract(t.request_headers_json,'$."x-interaction-type"')
+                   FROM turns t WHERE t.context_id = c.context_id
+                   ORDER BY t.turn_index DESC LIMIT 1) AS interaction_type
+         FROM contexts c WHERE c.session_id = ?
+         ORDER BY c.context_id ASC`
+      )
+      .all(sessionId);
+
+    const backgrounds = [];
+    const conversational = [];
+    for (const r of rows) {
+      const isBackground = r.turn_count > 0 && r.background_turns === r.turn_count;
+      (isBackground ? backgrounds : conversational).push(r);
+    }
+
+    const subIds = this.storeSubAgentIds(sessionId); // count surfaced via verification(); see below
+
+    const groups = [];
+
+    for (const b of backgrounds) {
+      groups.push({
+        synthetic_id: b.context_id,
+        kind: 'background',
+        label: 'Background (title/summary)',
+        member_ids: [b.context_id],
+        turn_count: b.turn_count,
+        first_seen_at: b.first_seen_at,
+        min_at: b.min_at,
+        interaction_type: b.interaction_type,
+        agent_id: b.agent_id,
+      });
+    }
+
+    const convSorted = conversational.slice().sort(
+      (a, b) => String(a.min_at || '').localeCompare(String(b.min_at || '')) || a.context_id - b.context_id
+    );
+
+    // Merge every conversational thread into one "Main agent" unit. We deliberately do NOT split out
+    // sub-agents here: the wire carries no signal that attributes a captured thread to a specific
+    // sub-agent (x-agent-task-id rotates for the main agent too), so any split would be a guess and
+    // reintroduce the mislabeling this fix removes. The authoritative sub-agent *count* (store
+    // agent_id) is surfaced separately via verification().subAgents. When real sub-agent capture and a
+    // reliable mapping exist, split them here using subIds.
+    void subIds;
+    if (convSorted.length > 0) {
+      const memberIds = convSorted.map((c) => c.context_id);
+      groups.push({
+        synthetic_id: Math.min(...memberIds),
+        kind: 'main',
+        label: 'Main agent',
+        member_ids: memberIds,
+        turn_count: convSorted.reduce((s, c) => s + c.turn_count, 0),
+        first_seen_at: convSorted[0].first_seen_at,
+        min_at: convSorted[0].min_at,
+        interaction_type: convSorted[convSorted.length - 1].interaction_type,
+        agent_id: null,
+      });
+    }
+
+    groups.sort(
+      (a, b) => String(a.min_at || '').localeCompare(String(b.min_at || '')) || a.synthetic_id - b.synthetic_id
+    );
+    return groups;
+  }
+
   // Completeness check: compare our captured turns against Copilot's own ground-truth record of
   // billed model calls (assistant_usage_events in the session store). Every billed call should have
   // a corresponding captured "agent" turn; background calls (e.g. title/summary generation) that
@@ -200,69 +301,54 @@ export class Db {
       .all();
     return rows.map((r) => ({
       ...r,
+      // Report the display-context count (merged main + backgrounds), matching what listContexts
+      // returns, rather than the raw captured-thread count.
+      context_count: this.contextGroups(r.session_id).length,
       ...this.enrichment(r.session_id),
       verification: this.verification(r.session_id),
     }));
   }
 
   listContexts(sessionId) {
-    // Derive display labels at read time from each context's interaction type so a background
-    // title/summary call can never be mislabeled as the main agent. Ordering follows first capture.
-    const rows = this.db
-      .prepare(
-        `SELECT c.context_id, c.session_id, c.agent_id, c.first_seen_at, c.thread_key,
-                (SELECT COUNT(*) FROM turns t WHERE t.context_id = c.context_id) AS turn_count,
-                (SELECT COUNT(*) FROM turns t WHERE t.context_id = c.context_id
-                   AND IFNULL(json_extract(t.request_headers_json,'$."x-interaction-type"'),'')
-                       LIKE '%background%') AS background_turns,
-                (SELECT json_extract(t.request_headers_json,'$."x-interaction-type"')
-                   FROM turns t WHERE t.context_id = c.context_id
-                   ORDER BY t.turn_index DESC LIMIT 1) AS interaction_type
-         FROM contexts c WHERE c.session_id = ?
-         ORDER BY c.context_id ASC`
-      )
-      .all(sessionId);
-
-    let agentIndex = 0;
-    return rows.map((r) => {
-      const isBackground = r.turn_count > 0 && r.background_turns === r.turn_count;
-      let kind;
-      let label;
-      if (isBackground) {
-        kind = 'background';
-        label = 'Background (title/summary)';
-      } else if (agentIndex === 0) {
-        kind = 'main';
-        label = 'Main agent';
-        agentIndex += 1;
-      } else {
-        kind = 'sub';
-        label = `Sub-agent ${agentIndex}`;
-        agentIndex += 1;
-      }
-      return {
-        context_id: r.context_id,
-        session_id: r.session_id,
-        label,
-        kind,
-        interaction_type: r.interaction_type,
-        agent_id: r.agent_id,
-        first_seen_at: r.first_seen_at,
-        turn_count: r.turn_count,
-      };
-    });
+    // Display units are driven by the store's sub-agent ground truth (see contextGroups). A rotating
+    // x-agent-task-id never fabricates a "Sub-agent"; conversational main-agent threads collapse into
+    // a single "Main agent" context when the store reports no real sub-agents.
+    return this.contextGroups(sessionId).map((g) => ({
+      context_id: g.synthetic_id,
+      session_id: sessionId,
+      label: g.label,
+      kind: g.kind,
+      interaction_type: g.interaction_type,
+      agent_id: g.agent_id,
+      first_seen_at: g.first_seen_at,
+      turn_count: g.turn_count,
+      member_ids: g.member_ids,
+    }));
   }
 
-  // Lightweight list for diffing: canonical prompt text + a little metadata per turn.
+  // Lightweight list for diffing: canonical prompt text + a little metadata per turn. The contextId is
+  // a synthetic group id from listContexts; a merged "Main agent" unit spans several captured contexts,
+  // so we union their turns into one chronological, sequentially re-indexed timeline.
   listTurns(contextId) {
-    return this.db
+    const ctx = this.db.prepare('SELECT session_id FROM contexts WHERE context_id = ?').get(contextId);
+    let memberIds = [contextId];
+    if (ctx) {
+      const group = this.contextGroups(ctx.session_id).find(
+        (g) => g.synthetic_id === contextId || g.member_ids.includes(contextId)
+      );
+      if (group) memberIds = group.member_ids;
+    }
+    const placeholders = memberIds.map(() => '?').join(',');
+    const rows = this.db
       .prepare(
         `SELECT id, turn_index, model, finish_reason, captured_at, duration_ms,
                 status_code, canonical_prompt_text, usage_json,
                 request_payload_bytes, common_prefix_bytes
-         FROM turns WHERE context_id = ? ORDER BY turn_index ASC`
+         FROM turns WHERE context_id IN (${placeholders})
+         ORDER BY captured_at ASC, id ASC`
       )
-      .all(contextId);
+      .all(...memberIds);
+    return rows.map((r, i) => ({ ...r, turn_index: i }));
   }
 
   getTurn(id) {
