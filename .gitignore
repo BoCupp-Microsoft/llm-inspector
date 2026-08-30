@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# python bytecode
+__pycache__/
+*.py[cod]
+
+# web build output
+web/dist/
+
+# captured session data (SQLite tracer DB + artifacts)
+sessions/
+
+# repo-local mitmproxy confdir (CA cert + PRIVATE KEY) — never commit
+.mitmproxy/
+
+# personal keys / tokens
+secrets/
+.env
+
+# mitmproxy flow dumps
+*.mmp
+
+# misc
+*.log
+.DS_Store
