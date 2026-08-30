@@ -266,7 +266,7 @@ def test_store_turn_payload_metrics():
     conn = sqlite3.connect(":memory:")
     conn.executescript(addon.SCHEMA)
     addon._ensure_columns(conn, "turns", addon.TURN_COLUMN_MIGRATIONS)
-    addon._PREV_PAYLOAD_BYTES.clear()
+    addon._PREV_CANON.clear()
     sid = "s-payload"
     meta = {"host": "h", "path": "/responses", "method": "WEBSOCKET"}
     parsed = {"content": "", "tool_calls": [], "usage": None, "finish_reason": "completed"}
@@ -289,7 +289,13 @@ def test_store_turn_payload_metrics():
     check("first turn total bytes", rows[0][2] == len(raw0))
     check("second turn total bytes", rows[1][2] == len(raw1))
     check("first turn prefix bytes absent", rows[0][3] is None)
-    check("second turn prefix bytes exact", rows[1][3] == addon.common_prefix_len(raw0, raw1))
+    # common_prefix_bytes now measures the shared leading run of the *canonical prompt*, not the raw
+    # wire payload. req0 and req1 share the "### [0] system / SYS" header, then diverge at message 1.
+    canon0 = addon.canonical_prompt(req0["messages"])
+    canon1 = addon.canonical_prompt(req1["messages"])
+    expected_prefix = addon.common_prefix_len(canon0.encode("utf-8"), canon1.encode("utf-8"))
+    check("second turn canonical prefix bytes exact", rows[1][3] == expected_prefix)
+    check("canonical prefix is the shared system header", expected_prefix > 0 and expected_prefix < rows[1][2])
     check("stored payload scrubbed", "secret" not in rows[0][1] and '"token":"REDACTED"' in rows[0][1])
 
 

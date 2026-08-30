@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import type { TurnLite } from '../types';
-import { buildDiffChunks, diffStats, lineDiff, splitLines, type DiffChunk, type DiffOp } from '../diff';
+import { buildDiffChunks, commonPrefix, diffStats, lineDiff, splitLines, type DiffChunk, type DiffOp } from '../diff';
 
 function formatBytes(n: number | null): string {
   if (n == null) return '\u2014';
@@ -75,6 +75,10 @@ function TurnBlock({
     [prevText, turn.canonical_prompt_text]
   );
   const stats = useMemo(() => diffStats(ops), [ops]);
+  const prefix = useMemo(
+    () => commonPrefix(prevText, turn.canonical_prompt_text),
+    [prevText, turn.canonical_prompt_text]
+  );
 
   return (
     <section className="turn-block">
@@ -86,14 +90,20 @@ function TurnBlock({
           <span className="add">+{stats.added}</span>
           <span className="del">-{stats.removed}</span>
           {turn.turn_index > 0 && <span className="eq">{stats.common} common</span>}
-          {turn.turn_index > 0 && turn.common_prefix_bytes != null && (
-            <span className="bytes" title="Matching request-payload prefix bytes versus the previous turn in this context">
-              prefix {formatBytes(turn.common_prefix_bytes)}
+          {turn.turn_index > 0 && (
+            <span
+              className="bytes"
+              title={`Leading canonical-prompt content identical to the previous turn in this context: ${prefix.lines} lines / ${formatBytes(prefix.bytes)} — the prefix-cache candidate. Measured on the ordered, normalized prompt, not raw wire bytes.`}
+            >
+              prefix {(prefix.ratio * 100).toFixed(1)}%
             </span>
           )}
           {turn.request_payload_bytes != null && (
-            <span className="bytes subtle" title="Total request-payload bytes captured for this turn">
-              total {formatBytes(turn.request_payload_bytes)}
+            <span
+              className="bytes subtle"
+              title="Total raw request-payload bytes on the wire for this turn (JSON envelope, tool schemas, escaping) — larger than the canonical prompt the prefix % is measured against."
+            >
+              payload {formatBytes(turn.request_payload_bytes)}
             </span>
           )}
         </span>

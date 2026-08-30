@@ -196,6 +196,36 @@ export function splitLines(text: string | null | undefined): string[] {
   return lines;
 }
 
+export interface CommonPrefix {
+  lines: number; // number of identical leading lines
+  bytes: number; // UTF-8 bytes of the identical leading run (incl. newline separators)
+  ratio: number; // prefixBytes / current-turn canonical bytes (0..1)
+}
+
+function utf8Bytes(s: string): number {
+  // Browser + Node both expose TextEncoder.
+  return new TextEncoder().encode(s).length;
+}
+
+// Longest common *line* prefix between the previous and current canonical prompt text.
+// This is the honest "how much of this turn's prompt is byte-identical to the previous turn"
+// metric — the leading run the model's prefix cache can reuse. Measured on canonical prompt
+// text (ordered, normalized), NOT raw wire bytes, so it matches the diff view's "N common".
+export function commonPrefix(prev: string | null | undefined, next: string | null | undefined): CommonPrefix {
+  const a = splitLines(prev);
+  const b = splitLines(next);
+  const nextBytes = utf8Bytes(next || '');
+  let lines = 0;
+  let bytes = 0;
+  const max = Math.min(a.length, b.length);
+  while (lines < max && a[lines] === b[lines]) {
+    bytes += utf8Bytes(b[lines]) + 1; // +1 for the '\n' that joins each line
+    lines++;
+  }
+  const ratio = nextBytes > 0 ? Math.min(1, bytes / nextBytes) : 0;
+  return { lines, bytes, ratio };
+}
+
 export interface DiffStats {
   added: number;
   removed: number;

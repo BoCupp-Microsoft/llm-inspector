@@ -31,7 +31,12 @@ SESSION_ID = os.environ.get("CAPTURE_SESSION_ID") or ""
 SESSION_ID_FILE = os.environ.get("CAPTURE_SESSION_ID_FILE") or ""
 MATCH_HOST = os.environ.get("CAPTURE_MATCH_HOST") or "githubcopilot.com"
 DEBUG_LOG = os.environ.get("CAPTURE_DEBUG_LOG") or ""
-_PREV_PAYLOAD_BYTES = {}
+# Previous turn's canonical prompt text per (session, context), used to measure how much of the
+# prompt carried over unchanged as a leading prefix. We deliberately diff the *canonical prompt*
+# rather than the raw wire bytes: stateful APIs (OpenAI Responses) put an ever-changing
+# previous_response_id at the very front of the payload and reorder the input array, so a raw-byte
+# prefix collapses to a meaningless ~68 bytes even when 99% of the content is identical.
+_PREV_CANON = {}
 
 
 def _debug(line):
@@ -678,13 +683,19 @@ def store_turn(conn, session_id, req_obj, parsed, meta, payload=None):
         (session_id, time.strftime("%Y-%m-%dT%H:%M:%S"), "live"),
     )
     context_id, turn_index = _assign_context(conn, session_id, msgkeys, thread_key)
-    raw_bytes = payload.get("raw_bytes") if payload else None
     payload_text = payload.get("text") if payload else None
     payload_bytes = payload.get("total_bytes") if payload else None
     cache_key = (session_id, context_id)
-    common_prefix_bytes = common_prefix_len(_PREV_PAYLOAD_BYTES.get(cache_key), raw_bytes)
-    if raw_bytes is not None:
-        _PREV_PAYLOAD_BYTES[cache_key] = raw_bytes
+    # common_prefix_bytes = UTF-8 byte length of the leading run of the canonical prompt that is
+    # identical to the previous turn in this context (a meaningful "how much carried over" / prefix-
+    # cache signal). Compared against len(canonical_prompt_text) it yields the shared-prefix ratio.
+    canon = canonical_prompt(messages)
+    prev_canon = _PREV_CANON.get(cache_key)
+    common_prefix_bytes = common_prefix_len(
+        prev_canon.encode("utf-8") if prev_canon is not None else None,
+        canon.encode("utf-8"),
+    )
+    _PREV_CANON[cache_key] = canon
     conn.execute(
         """INSERT INTO turns (
             session_id, context_id, turn_index, captured_at, flow_id, host, path, method,
@@ -714,7 +725,7 @@ def store_turn(conn, session_id, req_obj, parsed, meta, payload=None):
             payload_bytes,
             common_prefix_bytes,
             json.dumps(msgkeys),
-            canonical_prompt(messages),
+            canon,
             parsed["content"],
             json.dumps(parsed["tool_calls"]),
             parsed["finish_reason"],

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildDiffChunks, lineDiff, splitLines } from '../web/src/diff.ts';
+import { buildDiffChunks, commonPrefix, lineDiff, splitLines } from '../web/src/diff.ts';
 
 test('lineDiff keeps shared tool output aligned after an inserted header line', () => {
   const before = splitLines(
@@ -61,4 +61,37 @@ test('buildDiffChunks keeps small orientation context around changes', () => {
 
   assert.equal(chunks[2].kind, 'common');
   assert.equal(chunks[2].count, 3);
+});
+
+test('commonPrefix measures shared leading lines as a ratio of the current canonical prompt', () => {
+  const prev = ['### [0] system', 'SYS', 'shared', 'old-tail'].join('\n');
+  const next = ['### [0] system', 'SYS', 'shared', 'new-a', 'new-b'].join('\n');
+  const pfx = commonPrefix(prev, next);
+
+  // First three lines are identical, then they diverge.
+  assert.equal(pfx.lines, 3);
+  const expectedBytes =
+    new TextEncoder().encode('### [0] system').length + 1 +
+    new TextEncoder().encode('SYS').length + 1 +
+    new TextEncoder().encode('shared').length + 1;
+  assert.equal(pfx.bytes, expectedBytes);
+
+  const nextBytes = new TextEncoder().encode(next).length;
+  assert.ok(Math.abs(pfx.ratio - pfx.bytes / nextBytes) < 1e-9);
+  assert.ok(pfx.ratio > 0 && pfx.ratio < 1);
+});
+
+test('commonPrefix is 0 when the first line differs and full when identical', () => {
+  assert.equal(commonPrefix('a\nb', 'x\nb').lines, 0);
+  assert.equal(commonPrefix('a\nb', 'x\nb').bytes, 0);
+  assert.equal(commonPrefix('a\nb', 'x\nb').ratio, 0);
+
+  const same = 'same\ntext';
+  const full = commonPrefix(same, same);
+  assert.equal(full.lines, 2);
+  assert.equal(full.ratio, 1);
+
+  // No previous turn (turn 0) yields an empty prefix.
+  assert.equal(commonPrefix(null, 'anything').lines, 0);
+  assert.equal(commonPrefix('', '').ratio, 0);
 });
