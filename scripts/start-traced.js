@@ -2,7 +2,7 @@
 // with the repo-local CA and proxy env. Detects the Copilot session id for this run and tears
 // everything down on exit. All state stays under the repo.
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -71,10 +71,19 @@ const proxyEnv = {
   CAPTURE_SESSION_ID_FILE: SID_FILE,
   CAPTURE_SESSION_ID: '',
 };
+// Route proxy + viewer output to log files so their stdout/stderr can never bleed into (and
+// corrupt) the Copilot TUI, which owns this terminal. mitmproxy on Windows/Python 3.9 emits a
+// benign ConnectionResetError [WinError 10054] traceback when a client drops a TLS connection;
+// keeping it out of the shared console is what stops it from appearing over the Copilot UI.
+const PROXY_LOG = join(SESSIONS_DIR, 'proxy.log');
+const VIEWER_LOG = join(SESSIONS_DIR, 'viewer.log');
+const proxyLogFd = openSync(PROXY_LOG, 'a');
+const viewerLogFd = openSync(VIEWER_LOG, 'a');
+
 const proxy = spawn(
   MITMDUMP,
   ['-s', ADDON, '--set', `confdir=${CONFDIR}`, '--listen-port', String(PROXY_PORT), '-q'],
-  { stdio: 'inherit', env: proxyEnv }
+  { stdio: ['ignore', proxyLogFd, proxyLogFd], env: proxyEnv }
 );
 proxy.on('error', (e) => {
   console.error('[trace] failed to start mitmdump:', e.message, '\nRun: npm run setup');
@@ -83,7 +92,7 @@ proxy.on('error', (e) => {
 
 // --- start viewer server ---
 const server = spawn(process.execPath, [SERVER], {
-  stdio: 'inherit',
+  stdio: ['ignore', viewerLogFd, viewerLogFd],
   env: { ...process.env, VIEWER_PORT, TRACER_DB, COPILOT_SESSION_STORE: SESSION_STORE },
 });
 
@@ -122,8 +131,8 @@ const poll = setInterval(() => {
   }
 }, 500);
 
-console.log(`\n[trace] proxy    : http://127.0.0.1:${PROXY_PORT}`);
-console.log(`[trace] viewer   : http://127.0.0.1:${VIEWER_PORT}`);
+console.log(`\n[trace] proxy    : http://127.0.0.1:${PROXY_PORT}  (log: ${PROXY_LOG})`);
+console.log(`[trace] viewer   : http://127.0.0.1:${VIEWER_PORT}  (log: ${VIEWER_LOG})`);
 console.log(`[trace] launching: ${COPILOT_CMD} ${process.argv.slice(2).join(' ')}\n`);
 
 // --- launch copilot through the proxy ---

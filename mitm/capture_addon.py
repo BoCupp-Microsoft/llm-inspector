@@ -604,6 +604,38 @@ def store_turn(conn, session_id, req_obj, parsed, meta):
     return context_id, turn_index
 
 
+def running():
+    """Suppress benign Windows ProactorEventLoop disconnect noise.
+
+    When a client (Copilot) abruptly drops a TLS connection, asyncio's ``_call_connection_lost``
+    calls ``socket.shutdown(SHUT_RDWR)`` which raises ``ConnectionResetError [WinError 10054]``.
+    On Python 3.9 this isn't guarded, so asyncio routes it to the loop exception handler and prints
+    a full traceback. It's harmless — install a handler that drops these specific errors and chains
+    everything else to the previous handler.
+    """
+    try:
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+    except Exception:  # pragma: no cover - defensive
+        return
+
+    prev = loop.get_exception_handler()
+
+    def handler(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return
+        if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (10053, 10054, 64):
+            return
+        if prev is not None:
+            prev(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+
+
 def request(flow: http.HTTPFlow):
     # Diagnostic only (enabled via CAPTURE_DEBUG_LOG): record every host+path the client hits.
     if DEBUG_LOG:
