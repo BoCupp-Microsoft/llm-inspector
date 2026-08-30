@@ -731,14 +731,90 @@ def _ws_frames(flow):
     return frames
 
 
-def websocket_end(flow: http.HTTPFlow):
-    """Capture OpenAI Responses turns delivered over the /responses WebSocket (GPT-5.x / Sol).
+# Incremental Responses-WS capture state, keyed by flow id. The main-agent conversation runs over
+# a single long-lived WebSocket, so waiting for websocket_end would leave a live session empty.
+# Instead we flush each turn the moment its terminal event arrives.
+_WS_STATE = {}
+_WS_TERMINAL = ("response.completed", "response.failed", "response.incomplete", "error")
 
-    A single socket may carry several turns; each is delimited by a client `response.create`
-    frame followed by the server-side `response.*` events until the next create.
+
+def _ws_meta(flow):
+    return {
+        "flow_id": flow.id,
+        "host": flow.request.pretty_host,
+        "path": flow.request.path,
+        "method": "WEBSOCKET",
+        "status_code": flow.response.status_code if flow.response else 101,
+        "headers": _redact_headers(flow),
+    }
+
+
+def _flush_ws_segment(seg, meta):
+    """Store one completed Responses turn exactly once."""
+    if not seg or seg.get("flushed") or seg.get("req") is None:
+        return
+    seg["flushed"] = True
+    req_obj = normalize_responses_request(seg["req"])
+    parsed = parse_responses_frames(seg["events"])
+    conn = _connect()
+    try:
+        store_turn(conn, _current_session_id(), req_obj, parsed, dict(meta))
+    finally:
+        conn.close()
+
+
+def websocket_message(flow: http.HTTPFlow):
+    """Capture each Responses turn as soon as it completes so a live session populates immediately
+    instead of only when the long-lived WebSocket finally closes.
+
+    A socket carries many turns: a client `response.create` opens a turn; the server streams
+    `response.*` events until a terminal event (`response.completed`/`failed`/`incomplete`/`error`)
+    closes it. We flush on the terminal event, and fall back to flushing on the next `create` if a
+    terminal event was somehow missed.
     """
     if _endpoint_kind(flow.request.pretty_host, flow.request.path) != "openai_responses":
         return
+    ws = getattr(flow, "websocket", None)
+    if not ws or not ws.messages:
+        return
+    m = ws.messages[-1]
+    try:
+        text = m.content.decode("utf-8", "replace")
+    except AttributeError:
+        text = str(m.content)
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    st = _WS_STATE.setdefault(flow.id, {"cur": None})
+    meta = _ws_meta(flow)
+    if m.from_client:
+        if obj.get("type") == "response.create":
+            _flush_ws_segment(st["cur"], meta)  # fallback flush of a turn with no terminal event
+            st["cur"] = {"req": obj, "events": [], "flushed": False}
+    else:
+        cur = st["cur"]
+        if cur is not None and not cur["flushed"]:
+            cur["events"].append(obj)
+            if obj.get("type") in _WS_TERMINAL:
+                _flush_ws_segment(cur, meta)
+
+
+def websocket_end(flow: http.HTTPFlow):
+    """Finalize a Responses WebSocket. The incremental websocket_message hook has already stored
+    each completed turn; here we only flush a trailing turn that never got a terminal event (socket
+    closed mid-turn) and clean up state. If the incremental hook never ran (state absent), fall back
+    to reconstructing every turn from the full frame history."""
+    if _endpoint_kind(flow.request.pretty_host, flow.request.path) != "openai_responses":
+        return
+
+    st = _WS_STATE.pop(flow.id, None)
+    if st is not None:
+        _flush_ws_segment(st["cur"], _ws_meta(flow))
+        return
+
+    # Fallback: no incremental state (e.g. all frames delivered at close) — segment the full history.
     frames = _ws_frames(flow)
     if DEBUG_LOG:
         _debug(f"WS /responses frames={len(frames)}")

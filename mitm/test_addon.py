@@ -3,6 +3,7 @@
 Run: python mitm/test_addon.py   (mitmproxy must be importable)
 """
 
+import json
 import os
 import sqlite3
 import sys
@@ -215,6 +216,153 @@ def test_responses_threading():
     check("responses sub turn index resets", t2 == 0)
 
 
+class _FakeWsMsg:
+    def __init__(self, from_client, obj):
+        self.from_client = from_client
+        self.content = json.dumps(obj).encode("utf-8")
+
+
+class _FakeWs:
+    def __init__(self):
+        self.messages = []
+
+
+class _FakeReq:
+    pretty_host = "api.githubcopilot.com"
+    path = "/responses"
+
+    class headers:
+        @staticmethod
+        def items(multi=True):
+            return []
+
+
+class _FakeResp:
+    status_code = 101
+
+
+class _FakeWsFlow:
+    def __init__(self):
+        self.id = "flow-ws-1"
+        self.request = _FakeReq()
+        self.response = _FakeResp()
+        self.websocket = _FakeWs()
+
+    def push(self, from_client, obj):
+        self.websocket.messages.append(_FakeWsMsg(from_client, obj))
+
+
+def test_responses_ws_incremental():
+    """websocket_message flushes each Responses turn as it completes; websocket_end must not
+    re-store turns already captured incrementally."""
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+
+    def mk():
+        c = sqlite3.connect(path, timeout=30)
+        c.executescript(addon.SCHEMA)
+        return c
+
+    orig_connect, orig_sid = addon._connect, addon._current_session_id
+    addon._connect = mk
+    addon._current_session_id = lambda: "s-ws"
+    addon._WS_STATE.clear()
+
+    def sel():
+        c = mk()
+        try:
+            return c.execute("SELECT COUNT(*) FROM turns WHERE session_id='s-ws'").fetchone()[0]
+        finally:
+            c.close()
+    try:
+        flow = _FakeWsFlow()
+
+        flow.push(True, {"type": "response.create", "model": "gpt-5.4", "agent_task_id": "T1",
+                         "input": [{"type": "message", "role": "user", "content": "hi"}]})
+        addon.websocket_message(flow)
+        after_create = sel()
+
+        flow.push(False, {"type": "response.output_text.delta", "delta": "ok"})
+        addon.websocket_message(flow)
+        flow.push(False, {"type": "response.completed", "response": {"status": "completed"}})
+        addon.websocket_message(flow)
+        after_turn0 = sel()
+
+        flow.push(True, {"type": "response.create", "model": "gpt-5.4", "agent_task_id": "T1",
+                         "input": [{"type": "message", "role": "user", "content": "more"}]})
+        addon.websocket_message(flow)
+        flow.push(False, {"type": "response.completed", "response": {"status": "completed"}})
+        addon.websocket_message(flow)
+        after_turn1 = sel()
+
+        addon.websocket_end(flow)
+        after_end = sel()
+
+        check("ws create alone stores nothing", after_create == 0)
+        check("ws turn0 flushed on completed", after_turn0 == 1)
+        check("ws turn1 flushed on completed", after_turn1 == 2)
+        check("ws end does not duplicate", after_end == 2)
+        c = mk()
+        try:
+            ctx = c.execute("SELECT COUNT(*) FROM contexts WHERE session_id='s-ws'").fetchone()[0]
+            idx = [r[0] for r in c.execute(
+                "SELECT turn_index FROM turns WHERE session_id='s-ws' ORDER BY id")]
+        finally:
+            c.close()
+        check("ws same agent_task_id threads one context", ctx == 1)
+        check("ws turn indices increment", idx == [0, 1])
+    finally:
+        addon._connect, addon._current_session_id = orig_connect, orig_sid
+        addon._WS_STATE.clear()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+
+
+def test_responses_ws_end_fallback():
+    """When websocket_message never ran (all frames only available at close), websocket_end still
+    reconstructs every turn from the full frame history."""
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+
+    def mk():
+        c = sqlite3.connect(path, timeout=30)
+        c.executescript(addon.SCHEMA)
+        return c
+
+    orig_connect, orig_sid = addon._connect, addon._current_session_id
+    addon._connect = mk
+    addon._current_session_id = lambda: "s-ws2"
+    addon._WS_STATE.clear()
+    try:
+        flow = _FakeWsFlow()
+        flow.id = "flow-ws-2"
+        flow.push(True, {"type": "response.create", "model": "gpt-5.4", "agent_task_id": "T9",
+                         "input": [{"type": "message", "role": "user", "content": "hi"}]})
+        flow.push(False, {"type": "response.completed", "response": {"status": "completed"}})
+        addon.websocket_end(flow)  # no prior websocket_message calls
+        c = mk()
+        try:
+            n = c.execute("SELECT COUNT(*) FROM turns WHERE session_id='s-ws2'").fetchone()[0]
+        finally:
+            c.close()
+        check("ws end fallback reconstructs turns", n == 1)
+    finally:
+        addon._connect, addon._current_session_id = orig_connect, orig_sid
+        addon._WS_STATE.clear()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     test_sse()
     test_json()
@@ -226,6 +374,8 @@ if __name__ == "__main__":
     test_responses_request_normalize()
     test_responses_frames()
     test_responses_threading()
+    test_responses_ws_incremental()
+    test_responses_ws_end_fallback()
     print()
     if check.failed:
         print(f"{check.failed} check(s) FAILED")
