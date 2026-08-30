@@ -27,7 +27,7 @@ const COPILOT_CMD = process.env.COPILOT_CMD || 'copilot';
 const CONFDIR = join(REPO_ROOT, '.mitmproxy');
 const CA_PEM = join(CONFDIR, 'mitmproxy-ca-cert.pem');
 const SESSIONS_DIR = join(REPO_ROOT, 'sessions');
-const TRACER_DB = join(SESSIONS_DIR, 'tracer.db');
+const TRACER_DB = process.env.TRACER_DB || join(SESSIONS_DIR, 'tracer.db');
 const SID_FILE = join(SESSIONS_DIR, 'current_session.txt');
 const ADDON = join(REPO_ROOT, 'mitm', 'capture_addon.py');
 const SERVER = join(REPO_ROOT, 'server', 'index.js');
@@ -127,9 +127,14 @@ console.log(`[trace] viewer   : http://127.0.0.1:${VIEWER_PORT}`);
 console.log(`[trace] launching: ${COPILOT_CMD} ${process.argv.slice(2).join(' ')}\n`);
 
 // --- launch copilot through the proxy ---
-const copilot = spawn(COPILOT_CMD, process.argv.slice(2), {
+// Resolve copilot to a concrete path. Spawn a real .exe WITHOUT a shell so multi-word args
+// (e.g. -p "a prompt with spaces") are passed through intact; only fall back to a shell for
+// .cmd/.bat shims that can't be spawned directly on Windows.
+const COPILOT_EXE = resolveExe(COPILOT_CMD, 'COPILOT_EXE');
+const copilotViaShell = /\.(cmd|bat)$/i.test(COPILOT_EXE);
+const copilot = spawn(COPILOT_EXE, process.argv.slice(2), {
   stdio: 'inherit',
-  shell: true,
+  shell: copilotViaShell,
   env: {
     ...process.env,
     HTTPS_PROXY: `http://127.0.0.1:${PROXY_PORT}`,
@@ -139,6 +144,7 @@ const copilot = spawn(COPILOT_CMD, process.argv.slice(2), {
 });
 
 let tearingDown = false;
+const KEEP_ALIVE = /^(1|true|yes)$/i.test(process.env.TRACE_KEEP_ALIVE || '');
 function killTree(child) {
   if (!child || child.killed) return;
   if (process.platform === 'win32' && child.pid) {
@@ -158,7 +164,14 @@ function teardown(code) {
   process.exit(code ?? 0);
 }
 
-copilot.on('exit', (code) => teardown(code ?? 0));
+copilot.on('exit', (code) => {
+  if (KEEP_ALIVE) {
+    markSession('ended');
+    console.log(`[trace] copilot exited (code ${code ?? 0}); viewer kept alive on port ${VIEWER_PORT} — press Ctrl+C to stop`);
+    return;
+  }
+  teardown(code ?? 0);
+});
 copilot.on('error', (e) => {
   console.error(`[trace] failed to launch "${COPILOT_CMD}":`, e.message);
   teardown(1);

@@ -94,6 +94,22 @@ non-Node traffic (e.g. curl/browser) through the same proxy, trust
 Updates arrive over the WebSocket — no page refresh. You can also run read-only `SELECT`
 queries against the tracer DB from the UI for deeper digging.
 
+## Supported model endpoints
+
+The Copilot CLI talks to `*.githubcopilot.com` using different protocols depending on the model.
+The capture addon dispatches on the endpoint and normalizes all of them into the same turn schema:
+
+| Model family | Endpoint | Transport |
+| --- | --- | --- |
+| Claude Opus / Sonnet (4.8, 5, …) | `POST /v1/messages` (Anthropic Messages API) | HTTP + SSE |
+| OpenAI `chat/completions` models | `POST /chat/completions` | HTTP + SSE |
+| GPT-5.x / Sol (latest OpenAI) | `GET /responses` (OpenAI Responses API) | WebSocket |
+
+**Context threading** adapts to the API: stateless APIs (Anthropic, chat/completions) resend the
+full history each turn, so contexts are separated by prompt-prefix lineage. The Responses API is
+stateful (only new input items are sent per turn), so those turns are threaded by their stable
+`agent_task_id`; sub-agents get a distinct `agent_task_id` and land in their own context.
+
 ## npm scripts
 
 | Script | What it does |
@@ -103,6 +119,9 @@ queries against the tracer DB from the UI for deeper digging.
 | `npm run build` | Vite production build of `web/` → `web/dist/`. |
 | `npm run dev`   | Vite dev server for viewer development. |
 | `npm run server`| Run just the viewer server against an existing `sessions/tracer.db`. |
+| `npm test` / `npm run test:capture` | Integration test: trace a real `copilot` run and assert turns land in the DB. |
+| `npm run test:addon` | Addon parsing/redaction/threading unit tests (fast, no network). |
+| `npm run test:e2e` | Headed Playwright (Edge) test: watch turns stream into the viewer live. |
 
 ## Configuration (`.env`)
 
@@ -132,10 +151,16 @@ agent-loop/
 ## Testing
 
 ```powershell
-python mitm\test_addon.py       # addon parsing/redaction/threading unit tests
+npm run test:addon              # addon parsing/redaction/threading unit tests (fast, no network)
+npm run test:capture            # integration: trace a real copilot run, assert turns land in the DB
+npm run test:e2e                # headed Playwright (Edge): watch turns stream into the viewer live
 node scripts\ws_smoke.mjs       # server + WebSocket live-push end-to-end
 python scripts\seed_synthetic.py  # seed main + sub-agent turns to explore the UI
 ```
+
+`test:capture` and `test:e2e` launch a real, authenticated `copilot` through the proxy (a real,
+billable model request). Set `TEST_MODEL` to exercise a specific endpoint, e.g.
+`$env:TEST_MODEL='gpt-5.4'; npm run test:e2e` for the OpenAI Responses (WebSocket) path.
 
 ## Notes / troubleshooting
 

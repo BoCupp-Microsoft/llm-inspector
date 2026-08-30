@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS contexts (
     label               TEXT,
     agent_id            TEXT,
     parent_tool_call_id TEXT,
+    thread_key          TEXT,
     latest_keys_json    TEXT,
     turn_count          INTEGER DEFAULT 0,
     first_seen_at       TEXT

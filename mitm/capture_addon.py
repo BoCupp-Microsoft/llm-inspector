@@ -30,6 +30,17 @@ DB_PATH = os.environ.get("TRACER_DB") or os.path.join(os.getcwd(), "sessions", "
 SESSION_ID = os.environ.get("CAPTURE_SESSION_ID") or ""
 SESSION_ID_FILE = os.environ.get("CAPTURE_SESSION_ID_FILE") or ""
 MATCH_HOST = os.environ.get("CAPTURE_MATCH_HOST") or "githubcopilot.com"
+DEBUG_LOG = os.environ.get("CAPTURE_DEBUG_LOG") or ""
+
+
+def _debug(line):
+    if not DEBUG_LOG:
+        return
+    try:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 def _current_session_id():
@@ -66,6 +77,7 @@ CREATE TABLE IF NOT EXISTS contexts (
     label               TEXT,
     agent_id            TEXT,
     parent_tool_call_id TEXT,
+    thread_key          TEXT,
     latest_keys_json    TEXT,
     turn_count          INTEGER DEFAULT 0,
     first_seen_at       TEXT
@@ -233,12 +245,244 @@ def parse_json_response(obj):
     }
 
 
+# --- Anthropic Messages API (/v1/messages) ---------------------------------------------------
+
+def _anthropic_blocks_to_text(content):
+    """Normalize Anthropic message content (str | list of blocks) to (text, tool_calls, tool_ids)."""
+    if isinstance(content, str):
+        return content, [], []
+    texts, tool_calls, tool_ids = [], [], []
+    for b in content or []:
+        if not isinstance(b, dict):
+            texts.append(str(b))
+            continue
+        bt = b.get("type")
+        if bt == "text":
+            texts.append(b.get("text", ""))
+        elif bt == "tool_use":
+            tool_calls.append({
+                "id": b.get("id"),
+                "type": "function",
+                "function": {"name": b.get("name"), "arguments": json.dumps(b.get("input", {}), sort_keys=True)},
+            })
+            texts.append(f"[tool_use {b.get('name')} #{b.get('id')}]")
+        elif bt == "tool_result":
+            rid = b.get("tool_use_id")
+            tool_ids.append(rid)
+            texts.append(f"[tool_result #{rid}] " + _content_to_text(b.get("content")))
+        elif bt == "thinking":
+            texts.append("[thinking] " + str(b.get("thinking", "")))
+        elif bt == "image":
+            texts.append("[image]")
+        else:
+            texts.append(json.dumps(b, sort_keys=True))
+    return "\n".join(texts), tool_calls, tool_ids
+
+
+def normalize_anthropic_request(obj):
+    """Convert an Anthropic /v1/messages request into the internal OpenAI-like shape."""
+    messages = []
+    system = obj.get("system")
+    if system:
+        messages.append({"role": "system", "content": _content_to_text(system)})
+    for m in obj.get("messages", []) or []:
+        text, tcs, tids = _anthropic_blocks_to_text(m.get("content"))
+        nm = {"role": m.get("role", "user"), "content": text}
+        if tcs:
+            nm["tool_calls"] = tcs
+        if tids:
+            nm["tool_call_id"] = tids[0] if len(tids) == 1 else json.dumps(tids)
+        messages.append(nm)
+    req = {"model": obj.get("model"), "messages": messages, "tools": obj.get("tools", []) or []}
+    for k, v in obj.items():
+        if k not in ("system", "messages", "tools"):
+            req[k] = v
+    return req
+
+
+def parse_anthropic_sse(body_text):
+    """Reassemble an Anthropic streaming (SSE) response into content/tool_calls/usage/finish_reason."""
+    content_parts, blocks, usage, finish = [], {}, {}, None
+    for raw_line in body_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        t = obj.get("type")
+        if t == "message_start":
+            usage.update((obj.get("message") or {}).get("usage", {}) or {})
+        elif t == "content_block_start":
+            idx = obj.get("index", 0)
+            cb = obj.get("content_block", {}) or {}
+            blocks[idx] = {
+                "type": cb.get("type"),
+                "text": cb.get("text", "") if cb.get("type") == "text" else "",
+                "name": cb.get("name"),
+                "id": cb.get("id"),
+                "input": "",
+            }
+        elif t == "content_block_delta":
+            idx = obj.get("index", 0)
+            d = obj.get("delta", {}) or {}
+            b = blocks.setdefault(idx, {"type": d.get("type"), "text": "", "input": ""})
+            if d.get("type") == "text_delta":
+                b["text"] += d.get("text", "")
+                content_parts.append(d.get("text", ""))
+            elif d.get("type") == "input_json_delta":
+                b["input"] += d.get("partial_json", "")
+        elif t == "message_delta":
+            dd = obj.get("delta", {}) or {}
+            if dd.get("stop_reason"):
+                finish = dd["stop_reason"]
+            if obj.get("usage"):
+                usage.update(obj["usage"])
+    tool_calls = []
+    for idx in sorted(blocks):
+        b = blocks[idx]
+        if b.get("type") == "tool_use":
+            tool_calls.append({"id": b.get("id"), "name": b.get("name"), "arguments": b.get("input", "")})
+    return {"content": "".join(content_parts), "tool_calls": tool_calls, "usage": usage or None, "finish_reason": finish}
+
+
+def parse_anthropic_json(obj):
+    """Extract content/tool_calls/usage/finish from a non-streaming Anthropic response."""
+    content, tool_calls = [], []
+    for b in obj.get("content", []) or []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text":
+            content.append(b.get("text", ""))
+        elif b.get("type") == "tool_use":
+            tool_calls.append({"id": b.get("id"), "name": b.get("name"), "arguments": json.dumps(b.get("input", {}), sort_keys=True)})
+    return {"content": "".join(content), "tool_calls": tool_calls, "usage": obj.get("usage"), "finish_reason": obj.get("stop_reason")}
+
+
+# --- OpenAI Responses API (/responses over WebSocket) ---------------------------------------
+
+def _responses_content_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                if p.get("type") in ("input_text", "output_text", "text", "summary_text"):
+                    parts.append(p.get("text", ""))
+                elif p.get("type") in ("input_image", "output_image"):
+                    parts.append("[image]")
+                else:
+                    parts.append(json.dumps(p, sort_keys=True))
+            else:
+                parts.append(str(p))
+        return "\n".join(parts)
+    return _content_to_text(content)
+
+
+def normalize_responses_request(obj):
+    """Convert an OpenAI Responses (response.create) request into the internal shape."""
+    messages = []
+    instr = obj.get("instructions")
+    if instr:
+        messages.append({"role": "system", "content": _content_to_text(instr)})
+    for it in obj.get("input", []) or []:
+        if not isinstance(it, dict):
+            messages.append({"role": "user", "content": str(it)})
+            continue
+        t = it.get("type")
+        if t == "message" or (t is None and it.get("role")):
+            messages.append({"role": it.get("role", "user"), "content": _responses_content_text(it.get("content"))})
+        elif t == "function_call":
+            messages.append({
+                "role": "assistant",
+                "content": f"[function_call {it.get('name')}]",
+                "tool_calls": [{
+                    "id": it.get("call_id") or it.get("id"),
+                    "type": "function",
+                    "function": {"name": it.get("name"), "arguments": it.get("arguments", "")},
+                }],
+            })
+        elif t == "function_call_output":
+            messages.append({"role": "tool", "content": _content_to_text(it.get("output")), "tool_call_id": it.get("call_id")})
+        elif t == "reasoning":
+            summ = it.get("summary") or []
+            txt = "\n".join(s.get("text", "") for s in summ if isinstance(s, dict))
+            messages.append({"role": "assistant", "content": "[reasoning] " + txt})
+        else:
+            messages.append({"role": "system", "content": json.dumps(it, sort_keys=True)})
+    req = {"model": obj.get("model"), "messages": messages, "tools": obj.get("tools", []) or []}
+    for k, v in obj.items():
+        if k not in ("input", "instructions", "tools", "headers"):
+            req[k] = v
+    return req
+
+
+def parse_responses_frames(events):
+    """Reassemble OpenAI Responses server-side WS events into content/tool_calls/usage/finish."""
+    content_parts, tool_calls, usage, finish = [], [], None, None
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        t = ev.get("type")
+        if t == "response.output_text.delta":
+            content_parts.append(ev.get("delta", ""))
+        elif t == "response.output_item.done":
+            item = ev.get("item", {}) or {}
+            if item.get("type") == "function_call":
+                tool_calls.append({
+                    "id": item.get("call_id") or item.get("id"),
+                    "name": item.get("name"),
+                    "arguments": item.get("arguments", ""),
+                })
+        elif t == "response.completed":
+            resp = ev.get("response", {}) or {}
+            finish = resp.get("status") or finish
+            usage = ev.get("copilot_usage") or resp.get("usage") or usage
+            if not content_parts:
+                for it in resp.get("output", []) or []:
+                    if it.get("type") == "message":
+                        for pt in it.get("content", []) or []:
+                            if pt.get("type") == "output_text":
+                                content_parts.append(pt.get("text", ""))
+        elif t in ("response.failed", "response.incomplete", "error"):
+            resp = ev.get("response", {}) or {}
+            finish = resp.get("status") or "error"
+    return {"content": "".join(content_parts), "tool_calls": tool_calls, "usage": usage, "finish_reason": finish}
+
+
+def _endpoint_kind(host, path):
+    """Classify a completion endpoint by host+path, or None if not a model turn.
+
+    Copilot uses different model APIs depending on the selected model:
+      * anthropic         -> POST .../v1/messages           (Claude Opus/Sonnet)  HTTP + SSE
+      * openai_chat       -> POST .../chat/completions       (OpenAI chat)         HTTP + SSE
+      * openai_responses  -> GET  .../responses (WebSocket)   (GPT-5.x / Sol)       WS frames
+    """
+    if MATCH_HOST not in (host or ""):
+        return None
+    p = path or ""
+    if "/v1/messages" in p:
+        return "anthropic"
+    if "chat/completions" in p:
+        return "openai_chat"
+    if p.rstrip("/").endswith("/responses"):
+        return "openai_responses"
+    return None
+
+
+def _http_kind(flow):
+    """Endpoint kind capturable over plain HTTP (not the WebSocket /responses)."""
+    kind = _endpoint_kind(flow.request.pretty_host, flow.request.path)
+    return kind if kind in ("anthropic", "openai_chat") else None
+
+
 def _matches(flow: http.HTTPFlow) -> bool:
-    host = flow.request.pretty_host or ""
-    path = flow.request.path or ""
-    if MATCH_HOST not in host:
-        return False
-    return "chat/completions" in path or path.rstrip("/").endswith("/responses")
+    return _http_kind(flow) is not None
 
 
 def _redact_headers(flow):
@@ -248,10 +492,34 @@ def _redact_headers(flow):
     return out
 
 
-def _assign_context(conn, session_id, msgkeys):
-    """Thread a turn into a context by longest full message-prefix match; create one if none."""
+def _assign_context(conn, session_id, msgkeys, thread_key=None):
+    """Thread a turn into a context.
+
+    Two strategies, depending on how the model API carries conversation state:
+      * thread_key given (stateful APIs like OpenAI Responses, which resend only new input and
+        identify the conversation by `agent_task_id`) -> match/create a context by exact key.
+      * thread_key None (stateless APIs like Anthropic /v1/messages and OpenAI chat, which resend
+        the full message history) -> match the context whose latest message-key list is a full
+        prefix of this turn's; longest wins. Sub-agents diverge into their own context.
+    """
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if thread_key is not None:
+        row = conn.execute(
+            "SELECT context_id, turn_count FROM contexts WHERE session_id=? AND thread_key=?",
+            (session_id, thread_key),
+        ).fetchone()
+        if row is not None:
+            context_id, turn_count = row
+            conn.execute(
+                "UPDATE contexts SET latest_keys_json=?, turn_count=turn_count+1 WHERE context_id=?",
+                (json.dumps(msgkeys), context_id),
+            )
+            return context_id, turn_count
+        return _new_context(conn, session_id, msgkeys, thread_key, now)
+
     rows = conn.execute(
-        "SELECT context_id, latest_keys_json, turn_count FROM contexts WHERE session_id=?",
+        "SELECT context_id, latest_keys_json, turn_count FROM contexts "
+        "WHERE session_id=? AND thread_key IS NULL",
         (session_id,),
     ).fetchall()
     best = None
@@ -267,15 +535,19 @@ def _assign_context(conn, session_id, msgkeys):
             (json.dumps(msgkeys), context_id),
         )
         return context_id, turn_count
-    # New context (main agent for the first, sub-agents thereafter).
+    return _new_context(conn, session_id, msgkeys, None, now)
+
+
+def _new_context(conn, session_id, msgkeys, thread_key, now):
+    """Create a new context (first is the main agent, later ones are sub-agents)."""
     existing = conn.execute(
         "SELECT COUNT(*) FROM contexts WHERE session_id=?", (session_id,)
     ).fetchone()[0]
     label = "Main agent" if existing == 0 else f"Sub-agent {existing}"
     cur = conn.execute(
-        "INSERT INTO contexts (session_id, label, latest_keys_json, turn_count, first_seen_at) "
-        "VALUES (?,?,?,1,?)",
-        (session_id, label, json.dumps(msgkeys), time.strftime("%Y-%m-%dT%H:%M:%S")),
+        "INSERT INTO contexts (session_id, label, thread_key, latest_keys_json, turn_count, first_seen_at) "
+        "VALUES (?,?,?,?,1,?)",
+        (session_id, label, thread_key, json.dumps(msgkeys), now),
     )
     return cur.lastrowid, 0
 
@@ -286,12 +558,15 @@ def store_turn(conn, session_id, req_obj, parsed, meta):
     tools = req_obj.get("tools", []) or []
     params = {k: v for k, v in req_obj.items() if k not in ("messages", "tools")}
     msgkeys = [message_key(m) for m in messages]
+    # Stateful APIs (OpenAI Responses) identify a conversation by agent_task_id; stateless ones
+    # (Anthropic, OpenAI chat) leave this None and thread by resent-history prefix instead.
+    thread_key = req_obj.get("agent_task_id")
 
     conn.execute(
         "INSERT OR IGNORE INTO capture_sessions (session_id, started_at, status) VALUES (?,?,?)",
         (session_id, time.strftime("%Y-%m-%dT%H:%M:%S"), "live"),
     )
-    context_id, turn_index = _assign_context(conn, session_id, msgkeys)
+    context_id, turn_index = _assign_context(conn, session_id, msgkeys, thread_key)
     conn.execute(
         """INSERT INTO turns (
             session_id, context_id, turn_index, captured_at, flow_id, host, path, method,
@@ -329,23 +604,51 @@ def store_turn(conn, session_id, req_obj, parsed, meta):
     return context_id, turn_index
 
 
+def request(flow: http.HTTPFlow):
+    # Diagnostic only (enabled via CAPTURE_DEBUG_LOG): record every host+path the client hits.
+    if DEBUG_LOG:
+        _debug(f"REQ {flow.request.method} {flow.request.pretty_host} {flow.request.path}")
+
+
 def response(flow: http.HTTPFlow):
-    if not _matches(flow):
+    if DEBUG_LOG:
+        _debug(
+            f"RESP {flow.response.status_code} {flow.request.pretty_host} "
+            f"{flow.request.path} kind={_endpoint_kind(flow.request.pretty_host, flow.request.path)} "
+            f"ct={flow.response.headers.get('content-type','')}"
+        )
+        _maybe_dump_http(flow)
+
+    kind = _http_kind(flow)
+    if kind is None:
         return
     try:
-        req_obj = json.loads(flow.request.get_text() or "{}")
+        raw_req = json.loads(flow.request.get_text() or "{}")
     except (json.JSONDecodeError, ValueError):
-        req_obj = {}
+        raw_req = {}
 
     body_text = flow.response.get_text() or ""
     content_type = flow.response.headers.get("content-type", "")
-    if "text/event-stream" in content_type or body_text.lstrip().startswith("data:"):
-        parsed = parse_sse(body_text)
-    else:
-        try:
-            parsed = parse_json_response(json.loads(body_text))
-        except (json.JSONDecodeError, ValueError):
-            parsed = {"content": "", "tool_calls": [], "usage": None, "finish_reason": None}
+    is_sse = "text/event-stream" in content_type or body_text.lstrip().startswith(("data:", "event:"))
+
+    if kind == "anthropic":
+        req_obj = normalize_anthropic_request(raw_req)
+        if is_sse:
+            parsed = parse_anthropic_sse(body_text)
+        else:
+            try:
+                parsed = parse_anthropic_json(json.loads(body_text))
+            except (json.JSONDecodeError, ValueError):
+                parsed = {"content": "", "tool_calls": [], "usage": None, "finish_reason": None}
+    else:  # openai_chat
+        req_obj = raw_req
+        if is_sse:
+            parsed = parse_sse(body_text)
+        else:
+            try:
+                parsed = parse_json_response(json.loads(body_text))
+            except (json.JSONDecodeError, ValueError):
+                parsed = {"content": "", "tool_calls": [], "usage": None, "finish_reason": None}
 
     duration_ms = None
     if flow.response.timestamp_end and flow.request.timestamp_start:
@@ -366,3 +669,89 @@ def response(flow: http.HTTPFlow):
         store_turn(conn, _current_session_id(), req_obj, parsed, meta)
     finally:
         conn.close()
+
+
+def _maybe_dump_http(flow):
+    """Diagnostic: dump a matched HTTP request/response body pair when CAPTURE_DUMP_DIR is set."""
+    d = os.environ.get("CAPTURE_DUMP_DIR")
+    if not d or _http_kind(flow) is None:
+        return
+    try:
+        os.makedirs(d, exist_ok=True)
+        stamp = str(int(time.time() * 1000))
+        with open(os.path.join(d, f"req_{stamp}.json"), "w", encoding="utf-8") as fh:
+            fh.write(flow.request.get_text() or "")
+        with open(os.path.join(d, f"resp_{stamp}.txt"), "w", encoding="utf-8") as fh:
+            fh.write(flow.response.get_text() or "")
+    except OSError:
+        pass
+
+
+def _ws_frames(flow):
+    ws = getattr(flow, "websocket", None)
+    frames = []
+    for m in (ws.messages if ws else []):
+        try:
+            text = m.content.decode("utf-8", "replace")
+        except AttributeError:
+            text = str(m.content)
+        frames.append((bool(m.from_client), text))
+    return frames
+
+
+def websocket_end(flow: http.HTTPFlow):
+    """Capture OpenAI Responses turns delivered over the /responses WebSocket (GPT-5.x / Sol).
+
+    A single socket may carry several turns; each is delimited by a client `response.create`
+    frame followed by the server-side `response.*` events until the next create.
+    """
+    if _endpoint_kind(flow.request.pretty_host, flow.request.path) != "openai_responses":
+        return
+    frames = _ws_frames(flow)
+    if DEBUG_LOG:
+        _debug(f"WS /responses frames={len(frames)}")
+        if os.environ.get("CAPTURE_DUMP_DIR"):
+            try:
+                d = os.environ["CAPTURE_DUMP_DIR"]
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, f"ws_{int(time.time()*1000)}.ndjson"), "w", encoding="utf-8") as fh:
+                    for fc, text in frames:
+                        fh.write(json.dumps({"from_client": fc, "text": text}) + "\n")
+            except OSError:
+                pass
+
+    # Segment frames into (create_request, [server_events]) turns.
+    segments = []
+    cur = None
+    for from_client, text in frames:
+        try:
+            obj = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if from_client:
+            if obj.get("type") == "response.create":
+                cur = {"req": obj, "events": []}
+                segments.append(cur)
+        elif cur is not None:
+            cur["events"].append(obj)
+
+    if not segments:
+        return
+
+    meta_base = {
+        "flow_id": flow.id,
+        "host": flow.request.pretty_host,
+        "path": flow.request.path,
+        "method": "WEBSOCKET",
+        "status_code": flow.response.status_code if flow.response else 101,
+        "headers": _redact_headers(flow),
+    }
+    conn = _connect()
+    try:
+        for seg in segments:
+            req_obj = normalize_responses_request(seg["req"])
+            parsed = parse_responses_frames(seg["events"])
+            store_turn(conn, _current_session_id(), req_obj, parsed, dict(meta_base))
+    finally:
+        conn.close()
+

@@ -21,6 +21,12 @@ secrets/
 # mitmproxy flow dumps
 *.mmp
 
+# test output
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
 # misc
 *.log
 .DS_Store
