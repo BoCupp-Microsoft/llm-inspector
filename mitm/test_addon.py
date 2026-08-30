@@ -190,6 +190,39 @@ def test_responses_frames():
     check("responses frames usage", r["usage"]["total_nano_aiu"] == 123)
 
 
+def test_responses_completed_output():
+    """A function_call delivered only inside response.completed.response.output (never as a
+    standalone response.output_item.done) must still be captured — this is the blank-turn bug."""
+    events = [
+        {"type": "response.created", "response": {"status": "in_progress"}},
+        {"type": "response.reasoning_summary_text.delta", "delta": "thinking..."},
+        {"type": "response.completed", "response": {
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": " done"}]},
+                {"type": "function_call", "call_id": "cc9", "name": "sql", "arguments": "{\"q\":1}"},
+            ],
+        }, "copilot_usage": {"total_nano_aiu": 5}},
+    ]
+    r = addon.parse_responses_frames(events)
+    check("completed-output tool_call captured", len(r["tool_calls"]) == 1 and r["tool_calls"][0]["name"] == "sql")
+    check("completed-output tool_call id", r["tool_calls"][0]["id"] == "cc9")
+    check("completed-output reasoning captured", r["reasoning"] == "thinking... done")
+
+
+def test_responses_toolcall_dedup():
+    """The same tool call arriving via both output_item.done and completed.output is stored once."""
+    events = [
+        {"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "d1", "name": "sh", "arguments": "{}"}},
+        {"type": "response.completed", "response": {
+            "status": "completed",
+            "output": [{"type": "function_call", "call_id": "d1", "name": "sh", "arguments": "{}"}],
+        }},
+    ]
+    r = addon.parse_responses_frames(events)
+    check("tool_call deduped by id", len(r["tool_calls"]) == 1)
+
+
 def test_responses_threading():
     """Stateful Responses turns (same agent_task_id) thread into one context even though the
     resent message history is not a growing prefix."""
@@ -373,6 +406,8 @@ if __name__ == "__main__":
     test_anthropic_request_normalize()
     test_responses_request_normalize()
     test_responses_frames()
+    test_responses_completed_output()
+    test_responses_toolcall_dedup()
     test_responses_threading()
     test_responses_ws_incremental()
     test_responses_ws_end_fallback()

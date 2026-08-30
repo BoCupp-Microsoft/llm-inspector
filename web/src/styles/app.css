@@ -123,6 +123,7 @@ body {
 
 .json, .response-text { background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; padding: 10px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12px; }
 .hint { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin: 10px 0 4px; }
+.response-text.reasoning { color: var(--text-dim); font-style: italic; }
 .kv { width: 100%; border-collapse: collapse; }
 .kv td { border-bottom: 1px solid var(--border); padding: 4px 8px; font-family: var(--mono); font-size: 12px; vertical-align: top; }
 .kv td:first-child { color: var(--text-dim); width: 180px; }

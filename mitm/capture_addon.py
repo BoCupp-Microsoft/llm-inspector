@@ -423,36 +423,77 @@ def normalize_responses_request(obj):
 
 
 def parse_responses_frames(events):
-    """Reassemble OpenAI Responses server-side WS events into content/tool_calls/usage/finish."""
+    """Reassemble OpenAI Responses server-side WS events into content/tool_calls/reasoning/usage.
+
+    Tool calls and message text are read from BOTH the streaming events (response.output_item.done /
+    response.output_text.delta) AND the authoritative `response.completed` event's full output array,
+    deduped by id — some turns deliver a function_call only inside the completed payload, so relying
+    on the streaming events alone loses them and leaves the turn blank.
+    """
     content_parts, tool_calls, usage, finish = [], [], None, None
+    reasoning_parts = []
+    seen_calls = set()
+
+    def add_tool_call(item):
+        if not isinstance(item, dict):
+            return
+        cid = item.get("call_id") or item.get("id")
+        key = cid or (item.get("name"), item.get("arguments"))
+        if key in seen_calls:
+            return
+        seen_calls.add(key)
+        tool_calls.append({
+            "id": cid,
+            "name": item.get("name"),
+            "arguments": item.get("arguments", ""),
+        })
+
+    def add_reasoning(item):
+        for s in (item.get("summary") or []):
+            if isinstance(s, dict) and s.get("text"):
+                reasoning_parts.append(s["text"])
+
     for ev in events:
         if not isinstance(ev, dict):
             continue
         t = ev.get("type")
         if t == "response.output_text.delta":
             content_parts.append(ev.get("delta", ""))
+        elif t in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+            reasoning_parts.append(ev.get("delta", ""))
         elif t == "response.output_item.done":
             item = ev.get("item", {}) or {}
             if item.get("type") == "function_call":
-                tool_calls.append({
-                    "id": item.get("call_id") or item.get("id"),
-                    "name": item.get("name"),
-                    "arguments": item.get("arguments", ""),
-                })
-        elif t == "response.completed":
+                add_tool_call(item)
+            elif item.get("type") == "reasoning":
+                add_reasoning(item)
+        elif t in ("response.completed", "response.incomplete", "response.failed"):
             resp = ev.get("response", {}) or {}
             finish = resp.get("status") or finish
             usage = ev.get("copilot_usage") or resp.get("usage") or usage
-            if not content_parts:
-                for it in resp.get("output", []) or []:
-                    if it.get("type") == "message":
-                        for pt in it.get("content", []) or []:
-                            if pt.get("type") == "output_text":
-                                content_parts.append(pt.get("text", ""))
-        elif t in ("response.failed", "response.incomplete", "error"):
-            resp = ev.get("response", {}) or {}
-            finish = resp.get("status") or "error"
-    return {"content": "".join(content_parts), "tool_calls": tool_calls, "usage": usage, "finish_reason": finish}
+            for it in resp.get("output", []) or []:
+                if not isinstance(it, dict):
+                    continue
+                it_type = it.get("type")
+                if it_type == "function_call":
+                    add_tool_call(it)
+                elif it_type == "reasoning":
+                    add_reasoning(it)
+                elif it_type == "message" and not content_parts:
+                    for pt in it.get("content", []) or []:
+                        if isinstance(pt, dict) and pt.get("type") in ("output_text", "text"):
+                            content_parts.append(pt.get("text", ""))
+            if t != "response.completed" and finish is None:
+                finish = "error"
+        elif t == "error":
+            finish = "error"
+    return {
+        "content": "".join(content_parts),
+        "tool_calls": tool_calls,
+        "reasoning": "".join(reasoning_parts),
+        "usage": usage,
+        "finish_reason": finish,
+    }
 
 
 def _endpoint_kind(host, path):

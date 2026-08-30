@@ -39,6 +39,9 @@ export function TurnDetail({ turn, onClose }: { turn: TurnFull; onClose: () => v
   const usage = parse<Record<string, unknown>>(turn.usage_json, {});
   const toolCalls = parse<unknown[]>(turn.tool_calls_json, []);
   const headers = parse<Record<string, string>>(turn.request_headers_json, {});
+  const rawParsed = parse<{ reasoning?: string }>(turn.raw_response_json, {});
+  const reasoning = rawParsed.reasoning || '';
+  const hasResponse = Boolean(turn.response_text) || toolCalls.length > 0 || Boolean(reasoning);
 
   return (
     <div className="drawer-overlay" onClick={onClose}>
@@ -86,12 +89,26 @@ export function TurnDetail({ turn, onClose }: { turn: TurnFull; onClose: () => v
           )}
           {tab === 'response' && (
             <div className="response">
-              <pre className="response-text">{turn.response_text || '(empty)'}</pre>
+              {reasoning && (
+                <>
+                  <div className="hint">reasoning summary</div>
+                  <pre className="response-text reasoning">{reasoning}</pre>
+                </>
+              )}
+              {turn.response_text && (
+                <>
+                  <div className="hint">assistant text</div>
+                  <pre className="response-text">{turn.response_text}</pre>
+                </>
+              )}
               {toolCalls.length > 0 && (
                 <>
-                  <div className="hint">tool calls</div>
+                  <div className="hint">tool calls requested ({toolCalls.length})</div>
                   <pre className="json">{JSON.stringify(toolCalls, null, 2)}</pre>
                 </>
+              )}
+              {!hasResponse && (
+                <pre className="response-text">(no assistant output captured for this turn)</pre>
               )}
             </div>
           )}
