@@ -27,7 +27,8 @@ Copilot CLI ──HTTPS_PROXY──▶ mitmdump (+ mitm/capture_addon.py) ──
 
 - The **mitmproxy addon is the only writer** to `sessions/tracer.db`. It matches only
   model-completion flows (`githubcopilot.com` host, path `…/chat/completions` or `…/responses`),
-  redacts `authorization`/`api-key`/`cookie`/`token`/`secret` headers **before** storing, and
+  redacts `authorization`/`api-key`/`cookie`/`token`/`secret` headers **before** storing,
+  stores only a scrubbed request-payload view (never auth-bearing payload fields), and
   reassembles streamed SSE responses.
 - The **Node server** (`server/`) reads the tracer DB, enriches sessions from the Copilot
   `session-store.db` (read-only: repo/branch/summary/AIC/tokens), detects DB changes, and pushes
@@ -80,16 +81,19 @@ non-Node traffic (e.g. curl/browser) through the same proxy, trust
 
 1. **Sessions** (left): every session actually captured by the tracer, with **status**
    (`live` while its `copilot` is running, else `ended`), **turn count**, **AIC**
-   (Σ `total_nano_aiu` / 1e9), and repo/branch/summary from the Copilot session store.
+   (Σ `total_nano_aiu` / 1e9), a visible **session id** for investigations, and
+   repo/branch/summary from the Copilot session store.
 2. **Contexts** (for a selected session): the **main agent** plus any **sub-agents**. Sub-agents
    share the session id but each has its own growing prompt thread; contexts are separated by
    **content-lineage** (a turn joins the context whose latest prompt is a prefix of the new one).
 3. **Turn-evolution** (for a selected context): a scrollable, git-diff-style sequence of
-   `Turn 0..N` blocks. Runs of identical lines collapse to a single **"N common lines"** marker;
-   changed regions interleave the original (`-`) on top and the new line (`+`) underneath;
-   Turn 0 is all additions. Line numbers and hunk headers make it read like `git diff`.
+   `Turn 0..N` blocks. Runs of identical lines collapse to a single **"N common lines"** marker,
+   each change shows a few surrounding common lines for orientation, and hunk headers make it read
+   like `git diff`. Turn headers also show `common prefix bytes` and `total bytes` for the
+   intercepted **request payload** so you can compare the canonical-message diff with what the
+   client actually transmitted.
 4. **Turn detail** (drill in): the exact **messages**, **tool schemas**, reassembled **response**
-   + tool calls, **usage/params**, and normalized **raw JSON**.
+   + tool calls, **usage/params**, the scrubbed **request payload**, and normalized **raw JSON**.
 
 Updates arrive over the WebSocket — no page refresh. You can also run read-only `SELECT`
 queries against the tracer DB from the UI for deeper digging.
@@ -108,7 +112,10 @@ The capture addon dispatches on the endpoint and normalizes all of them into the
 **Context threading** adapts to the API: stateless APIs (Anthropic, chat/completions) resend the
 full history each turn, so contexts are separated by prompt-prefix lineage. The Responses API is
 stateful (only new input items are sent per turn), so those turns are threaded by their stable
-`agent_task_id`; sub-agents get a distinct `agent_task_id` and land in their own context.
+`agent_task_id`; sub-agents get a distinct `agent_task_id` and land in their own context. This is
+why a canonical-message diff can show a new `### [1] tool` block on GPT/Responses turns even when
+the model still has older conversation state server-side: the diff is showing the next transmitted
+delta request, not reconstructing the full hidden server-side context.
 
 ## npm scripts
 
@@ -119,6 +126,7 @@ stateful (only new input items are sent per turn), so those turns are threaded b
 | `npm run build` | Vite production build of `web/` → `web/dist/`. |
 | `npm run dev`   | Vite dev server for viewer development. |
 | `npm run server`| Run just the viewer server against an existing `sessions/tracer.db`. |
+| `npm run test:diff` | Line-diff unit tests for hunking/alignment behavior. |
 | `npm test` / `npm run test:capture` | Integration test: trace a real `copilot` run and assert turns land in the DB. |
 | `npm run test:addon` | Addon parsing/redaction/threading unit tests (fast, no network). |
 | `npm run test:e2e` | Headed Playwright (Edge) test: watch turns stream into the viewer live. |

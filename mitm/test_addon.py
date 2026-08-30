@@ -59,6 +59,19 @@ def test_redaction():
     check("keeps content-type", not addon.REDACT_RE.search("content-type"))
 
 
+def test_payload_scrub():
+    raw = json.dumps({
+        "model": "gpt-5.4",
+        "token": "top-secret",
+        "nested": {"session-id": "abc123"},
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    scrubbed = addon.scrub_payload_text(raw)
+    check("payload scrub removes token value", "top-secret" not in scrubbed)
+    check("payload scrub removes session id value", "abc123" not in scrubbed)
+    check("payload scrub keeps benign content", "hello" in scrubbed)
+
+
 def test_threading():
     conn = sqlite3.connect(":memory:")
     conn.executescript(addon.SCHEMA)
@@ -249,6 +262,37 @@ def test_responses_threading():
     check("responses sub turn index resets", t2 == 0)
 
 
+def test_store_turn_payload_metrics():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(addon.SCHEMA)
+    addon._ensure_columns(conn, "turns", addon.TURN_COLUMN_MIGRATIONS)
+    addon._PREV_PAYLOAD_BYTES.clear()
+    sid = "s-payload"
+    meta = {"host": "h", "path": "/responses", "method": "WEBSOCKET"}
+    parsed = {"content": "", "tool_calls": [], "usage": None, "finish_reason": "completed"}
+
+    req0 = {"model": "gpt-5.4", "agent_task_id": "T1",
+            "messages": [{"role": "system", "content": "SYS"}, {"role": "user", "content": "go"}]}
+    req1 = {"model": "gpt-5.4", "agent_task_id": "T1",
+            "messages": [{"role": "system", "content": "SYS"}, {"role": "tool", "content": "done", "tool_call_id": "fc1"}]}
+    raw0 = b'{"type":"response.create","token":"secret","input":[{"role":"user","content":"go"}]}'
+    raw1 = b'{"type":"response.create","token":"secret","input":[{"role":"tool","content":"done"}]}'
+
+    addon.store_turn(conn, sid, req0, parsed, dict(meta), payload=addon.payload_capture(raw0))
+    addon.store_turn(conn, sid, req1, parsed, dict(meta), payload=addon.payload_capture(raw1))
+
+    rows = conn.execute(
+        "SELECT turn_index, request_payload_text, request_payload_bytes, common_prefix_bytes "
+        "FROM turns WHERE session_id=? ORDER BY id",
+        (sid,),
+    ).fetchall()
+    check("first turn total bytes", rows[0][2] == len(raw0))
+    check("second turn total bytes", rows[1][2] == len(raw1))
+    check("first turn prefix bytes absent", rows[0][3] is None)
+    check("second turn prefix bytes exact", rows[1][3] == addon.common_prefix_len(raw0, raw1))
+    check("stored payload scrubbed", "secret" not in rows[0][1] and '"token":"REDACTED"' in rows[0][1])
+
+
 class _FakeWsMsg:
     def __init__(self, from_client, obj):
         self.from_client = from_client
@@ -342,10 +386,17 @@ def test_responses_ws_incremental():
             ctx = c.execute("SELECT COUNT(*) FROM contexts WHERE session_id='s-ws'").fetchone()[0]
             idx = [r[0] for r in c.execute(
                 "SELECT turn_index FROM turns WHERE session_id='s-ws' ORDER BY id")]
+            byte_rows = c.execute(
+                "SELECT request_payload_bytes, common_prefix_bytes, request_payload_text "
+                "FROM turns WHERE session_id='s-ws' ORDER BY id"
+            ).fetchall()
         finally:
             c.close()
         check("ws same agent_task_id threads one context", ctx == 1)
         check("ws turn indices increment", idx == [0, 1])
+        check("ws first turn total bytes stored", byte_rows[0][0] > 0)
+        check("ws second turn prefix bytes stored", byte_rows[1][1] is not None and byte_rows[1][1] > 0)
+        check("ws payload text stored", '"type":"response.create"' in byte_rows[0][2])
     finally:
         addon._connect, addon._current_session_id = orig_connect, orig_sid
         addon._WS_STATE.clear()
@@ -400,6 +451,7 @@ if __name__ == "__main__":
     test_sse()
     test_json()
     test_redaction()
+    test_payload_scrub()
     test_threading()
     test_canonical()
     test_anthropic_sse()
@@ -409,6 +461,7 @@ if __name__ == "__main__":
     test_responses_completed_output()
     test_responses_toolcall_dedup()
     test_responses_threading()
+    test_store_turn_payload_metrics()
     test_responses_ws_incremental()
     test_responses_ws_end_fallback()
     print()

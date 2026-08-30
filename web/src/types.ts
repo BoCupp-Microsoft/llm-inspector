@@ -46,6 +46,8 @@ export interface TurnLite {
   status_code: number | null;
   canonical_prompt_text: string | null;
   usage_json: string | null;
+  request_payload_bytes: number | null;
+  common_prefix_bytes: number | null;
 }
 
 export interface TurnFull extends TurnLite {
@@ -59,6 +61,7 @@ export interface TurnFull extends TurnLite {
   params_json: string | null;
   messages_json: string | null;
   tools_json: string | null;
+  request_payload_text: string | null;
   response_text: string | null;
   tool_calls_json: string | null;
   raw_response_json: string | null;

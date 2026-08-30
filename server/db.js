@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS turns (
     params_json           TEXT,
     messages_json         TEXT,
     tools_json            TEXT,
+    request_payload_text  TEXT,
+    request_payload_bytes INTEGER,
+    common_prefix_bytes   INTEGER,
     msgkeys_json          TEXT,
     canonical_prompt_text TEXT,
     response_text         TEXT,
@@ -55,6 +58,20 @@ CREATE INDEX IF NOT EXISTS idx_turns_ctx ON turns(session_id, context_id, turn_i
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
 `;
 
+const TURN_COLUMN_MIGRATIONS = {
+  request_payload_text: 'TEXT',
+  request_payload_bytes: 'INTEGER',
+  common_prefix_bytes: 'INTEGER',
+};
+
+function ensureColumns(db, table, columns) {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+  const existing = new Set(rows.map((row) => row.name));
+  for (const [name, type] of Object.entries(columns)) {
+    if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+  }
+}
+
 export class Db {
   constructor(tracerPath, sessionStorePath) {
     this.tracerPath = tracerPath;
@@ -64,6 +81,7 @@ export class Db {
     this.db.exec('PRAGMA journal_mode=WAL');
     this.db.exec('PRAGMA busy_timeout=30000');
     this.db.exec(SCHEMA);
+    ensureColumns(this.db, 'turns', TURN_COLUMN_MIGRATIONS);
     this.store = null;
     this.openStore();
   }
@@ -240,7 +258,8 @@ export class Db {
     return this.db
       .prepare(
         `SELECT id, turn_index, model, finish_reason, captured_at, duration_ms,
-                status_code, canonical_prompt_text, usage_json
+                status_code, canonical_prompt_text, usage_json,
+                request_payload_bytes, common_prefix_bytes
          FROM turns WHERE context_id = ? ORDER BY turn_index ASC`
       )
       .all(contextId);

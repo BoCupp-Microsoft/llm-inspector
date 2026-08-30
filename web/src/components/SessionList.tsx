@@ -40,6 +40,7 @@ export function SessionList({
                 )}
                 <span className={`status status-${s.status || 'unknown'}`}>{s.status || '—'}</span>
               </div>
+              <div className="row-sub session-id" title={s.session_id}>{s.session_id}</div>
               <div className="row-meta">
                 <span title="captured LLM turns">{s.turn_count} turns</span>
                 <span title="contexts (agents)">{s.context_count} ctx</span>

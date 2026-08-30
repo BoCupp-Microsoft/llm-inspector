@@ -1,45 +1,64 @@
 import { useMemo } from 'react';
 import type { TurnLite } from '../types';
-import { diffStats, lineDiff, splitLines, type DiffOp } from '../diff';
+import { buildDiffChunks, diffStats, lineDiff, splitLines, type DiffChunk, type DiffOp } from '../diff';
 
-function DiffRows({ ops }: { ops: DiffOp[] }) {
-  const rows: React.ReactNode[] = [];
-  let eqRun: DiffOp[] = [];
+function formatBytes(n: number | null): string {
+  if (n == null) return '\u2014';
+  return `${n.toLocaleString()} B`;
+}
 
-  const flushEq = (key: string) => {
-    if (eqRun.length === 0) return;
-    const first = eqRun[0];
-    const last = eqRun[eqRun.length - 1];
-    const range =
-      eqRun.length > 1 ? `${first.bno}\u2013${last.bno}` : `${first.bno}`;
-    rows.push(
-      <div className="dl dl-common" key={`c-${key}`}>
+function formatRange(first: number | null, last: number | null): string {
+  if (first == null && last == null) return '\u2014';
+  if (first == null) return `${last}`;
+  if (last == null || first === last) return `${first}`;
+  return `${first}\u2013${last}`;
+}
+
+function DiffLine({ op }: { op: DiffOp }) {
+  const kind = op.tag === 'eq' ? 'eq' : op.tag;
+  const sign = op.tag === 'del' ? '-' : op.tag === 'ins' ? '+' : '';
+  return (
+    <div className={`dl dl-${kind}`}>
+      <span className="gutter">{op.ano ?? ''}</span>
+      <span className="gutter">{op.bno ?? ''}</span>
+      <span className="sign">{sign}</span>
+      <span className="code">{op.text || '\u00a0'}</span>
+    </div>
+  );
+}
+
+function DiffChunkView({ chunk, chunkKey }: { chunk: DiffChunk; chunkKey: string }) {
+  if (chunk.kind === 'common') {
+    return (
+      <div className="dl dl-common" key={`c-${chunkKey}`}>
         <span className="gutter" />
         <span className="gutter" />
         <span className="sign" />
-        <span className="ln-common">{eqRun.length} common line{eqRun.length > 1 ? 's' : ''} ({range})</span>
+        <span className="ln-common">
+          {chunk.count} common line{chunk.count > 1 ? 's' : ''} (old {formatRange(chunk.firstOld, chunk.lastOld)} · new {formatRange(chunk.firstNew, chunk.lastNew)})
+        </span>
       </div>
     );
-    eqRun = [];
-  };
+  }
 
-  ops.forEach((op, idx) => {
-    if (op.tag === 'eq') {
-      eqRun.push(op);
-      return;
-    }
-    flushEq(String(idx));
-    rows.push(
-      <div className={`dl dl-${op.tag}`} key={idx}>
-        <span className="gutter">{op.ano ?? ''}</span>
-        <span className="gutter">{op.bno ?? ''}</span>
-        <span className="sign">{op.tag === 'del' ? '-' : '+'}</span>
-        <span className="code">{op.text || '\u00a0'}</span>
+  return (
+    <div className="diff-hunk" key={`h-${chunkKey}`}>
+      <div className="dl dl-hunk">
+        <span className="gutter" />
+        <span className="gutter" />
+        <span className="sign" />
+        <span className="code">@@ -{chunk.oldStart},{chunk.oldCount} +{chunk.newStart},{chunk.newCount} @@</span>
       </div>
-    );
-  });
-  flushEq('end');
-  return <>{rows}</>;
+      {chunk.ops.map((op, idx) => (
+        <DiffLine key={`${chunkKey}-${idx}`} op={op} />
+      ))}
+    </div>
+  );
+}
+
+function DiffRows({ ops }: { ops: DiffOp[] }) {
+  const chunks = useMemo(() => buildDiffChunks(ops, 3), [ops]);
+  return <>{chunks.map((chunk, idx) => <DiffChunkView key={idx} chunk={chunk} chunkKey={String(idx)} />)}</>;
 }
 
 function TurnBlock({
@@ -67,6 +86,16 @@ function TurnBlock({
           <span className="add">+{stats.added}</span>
           <span className="del">-{stats.removed}</span>
           {turn.turn_index > 0 && <span className="eq">{stats.common} common</span>}
+          {turn.turn_index > 0 && turn.common_prefix_bytes != null && (
+            <span className="bytes" title="Matching request-payload prefix bytes versus the previous turn in this context">
+              prefix {formatBytes(turn.common_prefix_bytes)}
+            </span>
+          )}
+          {turn.request_payload_bytes != null && (
+            <span className="bytes subtle" title="Total request-payload bytes captured for this turn">
+              total {formatBytes(turn.request_payload_bytes)}
+            </span>
+          )}
         </span>
         <button className="link" onClick={() => onOpen(turn.id)}>
           detail

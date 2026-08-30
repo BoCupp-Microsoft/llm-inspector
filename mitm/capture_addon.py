@@ -31,6 +31,7 @@ SESSION_ID = os.environ.get("CAPTURE_SESSION_ID") or ""
 SESSION_ID_FILE = os.environ.get("CAPTURE_SESSION_ID_FILE") or ""
 MATCH_HOST = os.environ.get("CAPTURE_MATCH_HOST") or "githubcopilot.com"
 DEBUG_LOG = os.environ.get("CAPTURE_DEBUG_LOG") or ""
+_PREV_PAYLOAD_BYTES = {}
 
 
 def _debug(line):
@@ -100,6 +101,9 @@ CREATE TABLE IF NOT EXISTS turns (
     params_json           TEXT,
     messages_json         TEXT,
     tools_json            TEXT,
+    request_payload_text  TEXT,
+    request_payload_bytes INTEGER,
+    common_prefix_bytes   INTEGER,
     msgkeys_json          TEXT,
     canonical_prompt_text TEXT,
     response_text         TEXT,
@@ -112,6 +116,12 @@ CREATE INDEX IF NOT EXISTS idx_turns_ctx ON turns(session_id, context_id, turn_i
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
 """
 
+TURN_COLUMN_MIGRATIONS = (
+    ("request_payload_text", "TEXT"),
+    ("request_payload_bytes", "INTEGER"),
+    ("common_prefix_bytes", "INTEGER"),
+)
+
 
 def _connect():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -120,7 +130,15 @@ def _connect():
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    _ensure_columns(conn, "turns", TURN_COLUMN_MIGRATIONS)
     return conn
+
+
+def _ensure_columns(conn, table, columns):
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def _content_to_text(content):
@@ -141,6 +159,58 @@ def _content_to_text(content):
                 parts.append(str(p))
         return "\n".join(parts)
     return json.dumps(content, sort_keys=True)
+
+
+def _scrub_payload_obj(obj):
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if REDACT_RE.search(str(key)):
+                out[key] = "REDACTED"
+            else:
+                out[key] = _scrub_payload_obj(value)
+        return out
+    if isinstance(obj, list):
+        return [_scrub_payload_obj(it) for it in obj]
+    return obj
+
+
+def scrub_payload_text(raw_text):
+    """Redact auth-bearing fields from a request payload before persistence."""
+    if not raw_text:
+        return ""
+    try:
+        obj = json.loads(raw_text)
+    except (json.JSONDecodeError, ValueError):
+        return "[non-json payload omitted]" if REDACT_RE.search(raw_text) else raw_text
+    return json.dumps(_scrub_payload_obj(obj), ensure_ascii=False, separators=(",", ":"))
+
+
+def payload_capture(raw_bytes=None, raw_text=None):
+    """Build the persisted request-payload view and exact byte counts for a request."""
+    if raw_bytes is None:
+        if raw_text is None:
+            return {"raw_bytes": None, "text": "", "total_bytes": None}
+        raw_bytes = raw_text.encode("utf-8")
+    if isinstance(raw_bytes, bytearray):
+        raw_bytes = bytes(raw_bytes)
+    if not isinstance(raw_bytes, bytes):
+        raw_bytes = str(raw_bytes).encode("utf-8")
+    return {
+        "raw_bytes": raw_bytes,
+        "text": scrub_payload_text(raw_bytes.decode("utf-8", "replace")),
+        "total_bytes": len(raw_bytes),
+    }
+
+
+def common_prefix_len(a, b):
+    if a is None or b is None:
+        return None
+    lim = min(len(a), len(b))
+    i = 0
+    while i < lim and a[i] == b[i]:
+        i += 1
+    return i
 
 
 def message_key(msg):
@@ -593,7 +663,7 @@ def _new_context(conn, session_id, msgkeys, thread_key, now):
     return cur.lastrowid, 0
 
 
-def store_turn(conn, session_id, req_obj, parsed, meta):
+def store_turn(conn, session_id, req_obj, parsed, meta, payload=None):
     """Thread + insert one turn. Shared by the live capture path and the test seeder."""
     messages = req_obj.get("messages", []) or []
     tools = req_obj.get("tools", []) or []
@@ -608,13 +678,21 @@ def store_turn(conn, session_id, req_obj, parsed, meta):
         (session_id, time.strftime("%Y-%m-%dT%H:%M:%S"), "live"),
     )
     context_id, turn_index = _assign_context(conn, session_id, msgkeys, thread_key)
+    raw_bytes = payload.get("raw_bytes") if payload else None
+    payload_text = payload.get("text") if payload else None
+    payload_bytes = payload.get("total_bytes") if payload else None
+    cache_key = (session_id, context_id)
+    common_prefix_bytes = common_prefix_len(_PREV_PAYLOAD_BYTES.get(cache_key), raw_bytes)
+    if raw_bytes is not None:
+        _PREV_PAYLOAD_BYTES[cache_key] = raw_bytes
     conn.execute(
         """INSERT INTO turns (
             session_id, context_id, turn_index, captured_at, flow_id, host, path, method,
             status_code, duration_ms, model, stream, request_headers_json, params_json,
-            messages_json, tools_json, msgkeys_json, canonical_prompt_text, response_text,
+            messages_json, tools_json, request_payload_text, request_payload_bytes,
+            common_prefix_bytes, msgkeys_json, canonical_prompt_text, response_text,
             tool_calls_json, finish_reason, usage_json, raw_response_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             session_id,
             context_id,
@@ -632,6 +710,9 @@ def store_turn(conn, session_id, req_obj, parsed, meta):
             json.dumps(params),
             json.dumps(messages),
             json.dumps(tools),
+            payload_text,
+            payload_bytes,
+            common_prefix_bytes,
             json.dumps(msgkeys),
             canonical_prompt(messages),
             parsed["content"],
@@ -736,10 +817,11 @@ def response(flow: http.HTTPFlow):
         "duration_ms": duration_ms,
         "headers": _redact_headers(flow),
     }
+    payload = payload_capture(getattr(flow.request, "raw_content", None), flow.request.get_text() or "")
 
     conn = _connect()
     try:
-        store_turn(conn, _current_session_id(), req_obj, parsed, meta)
+        store_turn(conn, _current_session_id(), req_obj, parsed, meta, payload=payload)
     finally:
         conn.close()
 
@@ -764,11 +846,12 @@ def _ws_frames(flow):
     ws = getattr(flow, "websocket", None)
     frames = []
     for m in (ws.messages if ws else []):
+        raw_bytes = m.content if isinstance(m.content, (bytes, bytearray)) else str(m.content).encode("utf-8")
         try:
-            text = m.content.decode("utf-8", "replace")
+            text = raw_bytes.decode("utf-8", "replace")
         except AttributeError:
             text = str(m.content)
-        frames.append((bool(m.from_client), text))
+        frames.append((bool(m.from_client), text, raw_bytes))
     return frames
 
 
@@ -797,9 +880,10 @@ def _flush_ws_segment(seg, meta):
     seg["flushed"] = True
     req_obj = normalize_responses_request(seg["req"])
     parsed = parse_responses_frames(seg["events"])
+    payload = payload_capture(seg.get("req_bytes"))
     conn = _connect()
     try:
-        store_turn(conn, _current_session_id(), req_obj, parsed, dict(meta))
+        store_turn(conn, _current_session_id(), req_obj, parsed, dict(meta), payload=payload)
     finally:
         conn.close()
 
@@ -819,8 +903,9 @@ def websocket_message(flow: http.HTTPFlow):
     if not ws or not ws.messages:
         return
     m = ws.messages[-1]
+    raw_bytes = m.content if isinstance(m.content, (bytes, bytearray)) else str(m.content).encode("utf-8")
     try:
-        text = m.content.decode("utf-8", "replace")
+        text = raw_bytes.decode("utf-8", "replace")
     except AttributeError:
         text = str(m.content)
     try:
@@ -833,7 +918,7 @@ def websocket_message(flow: http.HTTPFlow):
     if m.from_client:
         if obj.get("type") == "response.create":
             _flush_ws_segment(st["cur"], meta)  # fallback flush of a turn with no terminal event
-            st["cur"] = {"req": obj, "events": [], "flushed": False}
+            st["cur"] = {"req": obj, "req_bytes": raw_bytes, "events": [], "flushed": False}
     else:
         cur = st["cur"]
         if cur is not None and not cur["flushed"]:
@@ -872,14 +957,14 @@ def websocket_end(flow: http.HTTPFlow):
     # Segment frames into (create_request, [server_events]) turns.
     segments = []
     cur = None
-    for from_client, text in frames:
+    for from_client, text, raw_bytes in frames:
         try:
             obj = json.loads(text)
         except (json.JSONDecodeError, ValueError):
             continue
         if from_client:
             if obj.get("type") == "response.create":
-                cur = {"req": obj, "events": []}
+                cur = {"req": obj, "req_bytes": raw_bytes, "events": []}
                 segments.append(cur)
         elif cur is not None:
             cur["events"].append(obj)
@@ -900,7 +985,7 @@ def websocket_end(flow: http.HTTPFlow):
         for seg in segments:
             req_obj = normalize_responses_request(seg["req"])
             parsed = parse_responses_frames(seg["events"])
-            store_turn(conn, _current_session_id(), req_obj, parsed, dict(meta_base))
+            payload = payload_capture(seg.get("req_bytes"))
+            store_turn(conn, _current_session_id(), req_obj, parsed, dict(meta_base), payload=payload)
     finally:
         conn.close()
-

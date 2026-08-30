@@ -42,6 +42,7 @@ export function TurnDetail({ turn, onClose }: { turn: TurnFull; onClose: () => v
   const rawParsed = parse<{ reasoning?: string }>(turn.raw_response_json, {});
   const reasoning = rawParsed.reasoning || '';
   const hasResponse = Boolean(turn.response_text) || toolCalls.length > 0 || Boolean(reasoning);
+  const requestPayload = turn.request_payload_text || '';
 
   return (
     <div className="drawer-overlay" onClick={onClose}>
@@ -120,6 +121,8 @@ export function TurnDetail({ turn, onClose }: { turn: TurnFull; onClose: () => v
                   <tr><td>stream</td><td>{turn.stream ? 'yes' : 'no'}</td></tr>
                   <tr><td>status</td><td>{turn.status_code}</td></tr>
                   <tr><td>duration_ms</td><td>{turn.duration_ms ?? '—'}</td></tr>
+                  <tr><td>common_prefix_bytes</td><td>{turn.common_prefix_bytes ?? '—'}</td></tr>
+                  <tr><td>total_bytes</td><td>{turn.request_payload_bytes ?? '—'}</td></tr>
                   {Object.entries(usage).map(([k, v]) => (
                     <tr key={k}><td>{k}</td><td>{String(v)}</td></tr>
                   ))}
@@ -136,6 +139,8 @@ export function TurnDetail({ turn, onClose }: { turn: TurnFull; onClose: () => v
             <div className="raw">
               <div className="hint">request headers (auth redacted)</div>
               <pre className="json">{JSON.stringify(headers, null, 2)}</pre>
+              <div className="hint">request payload (scrubbed)</div>
+              <pre className="json">{requestPayload || '(payload unavailable)'}</pre>
               <div className="hint">normalized response</div>
               <pre className="json">{turn.raw_response_json || '{}'}</pre>
             </div>

@@ -58,6 +58,7 @@ body {
 .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-meta { display: flex; gap: 10px; color: var(--text-dim); font-size: 11px; margin-top: 3px; }
 .row-sub { color: var(--text-dim); font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-sub.session-id { font-family: var(--mono); }
 
 .status { font-size: 10px; padding: 1px 6px; border-radius: 8px; text-transform: uppercase; }
 .status-live { background: var(--add-bg); color: var(--add-fg); }
@@ -86,6 +87,8 @@ body {
 .stats .add { color: var(--add-fg); }
 .stats .del { color: var(--del-fg); }
 .stats .eq { color: var(--common); }
+.stats .bytes { color: #79c0ff; }
+.stats .bytes.subtle { color: var(--text-dim); }
 .link { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; }
 .link:hover { text-decoration: underline; }
 
@@ -94,11 +97,15 @@ body {
 .dl .gutter { color: var(--common); text-align: right; padding-right: 8px; user-select: none; opacity: .6; }
 .dl .sign { text-align: center; user-select: none; }
 .dl .code { padding-right: 10px; }
+.dl-eq { background: rgba(110, 118, 129, 0.08); }
+.dl-eq .code { color: var(--text); }
 .dl-ins { background: var(--add-bg); }
 .dl-ins .sign, .dl-ins .code { color: var(--add-fg); }
 .dl-del { background: var(--del-bg); }
 .dl-del .sign, .dl-del .code { color: var(--del-fg); }
 .dl-common { background: transparent; }
+.dl-hunk { background: rgba(88, 166, 255, 0.12); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.dl-hunk .code { color: #79c0ff; font-style: italic; }
 .ln-common { color: var(--common); font-style: italic; padding-left: 4px; }
 
 /* Drawer */
