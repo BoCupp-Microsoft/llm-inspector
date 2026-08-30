@@ -21,6 +21,12 @@ export function SessionList({
         {sessions.length === 0 && <div className="empty">No captured sessions yet.</div>}
         {sessions.map((s) => {
           const title = s.summary || s.repository || s.session_id.slice(0, 8);
+          const v = s.verification;
+          const missing = v?.missing ?? 0;
+          const warn =
+            missing > 0
+              ? `Copilot recorded ${v?.expected} model call(s); only ${v?.capturedAgent} captured — ${missing} not shown. Capture may be incomplete.`
+              : '';
           return (
             <button
               key={s.session_id}
@@ -29,6 +35,9 @@ export function SessionList({
             >
               <div className="row-top">
                 <span className="title" title={s.session_id}>{title}</span>
+                {missing > 0 && (
+                  <span className="warn-badge" title={warn}>⚠ {missing} missing</span>
+                )}
                 <span className={`status status-${s.status || 'unknown'}`}>{s.status || '—'}</span>
               </div>
               <div className="row-meta">
@@ -36,6 +45,7 @@ export function SessionList({
                 <span title="contexts (agents)">{s.context_count} ctx</span>
                 <span title="AIC = sum(total_nano_aiu)/1e9">AIC {fmtAic(s.aic)}</span>
               </div>
+              {warn && <div className="row-warn" title={warn}>{warn}</div>}
               {(s.repository || s.branch) && (
                 <div className="row-sub">{s.repository}{s.branch ? ` · ${s.branch}` : ''}</div>
               )}

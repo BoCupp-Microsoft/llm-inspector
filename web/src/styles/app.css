@@ -64,6 +64,14 @@ body {
 .status-ended { background: var(--bg-row); color: var(--text-dim); }
 .status-unknown { background: var(--bg-row); color: var(--text-dim); }
 
+/* Completeness warning */
+.warn-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: #5a3a00; color: #ffcf6b; white-space: nowrap; }
+.row-warn { color: #ffcf6b; font-size: 11px; margin-top: 3px; line-height: 1.35; white-space: normal; }
+
+/* Context kinds */
+.context-row.ctx-background .title { color: var(--text-dim); font-style: italic; }
+.context-row.ctx-sub .title::before { content: '↳ '; color: var(--text-dim); }
+
 /* Turn evolution / diff */
 .evolution-scroll { padding: 12px; }
 .turn-block { margin-bottom: 18px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }

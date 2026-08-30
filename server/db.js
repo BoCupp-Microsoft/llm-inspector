@@ -107,6 +107,67 @@ export class Db {
     }
   }
 
+  // Completeness check: compare our captured turns against Copilot's own ground-truth record of
+  // billed model calls (assistant_usage_events in the session store). Every billed call should have
+  // a corresponding captured "agent" turn; background calls (e.g. title/summary generation) that
+  // Copilot does not bill are captured as a bonus and excluded from the expected count.
+  verification(sessionId) {
+    const captured = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN IFNULL(json_extract(request_headers_json,'$."x-interaction-type"'),'')
+                    LIKE '%background%' THEN 1 ELSE 0 END) AS background,
+           SUM(CASE WHEN IFNULL(json_extract(request_headers_json,'$."x-interaction-type"'),'')
+                    LIKE '%background%' THEN 0 ELSE 1 END) AS agent
+         FROM turns WHERE session_id = ?`
+      )
+      .get(sessionId) || { background: 0, agent: 0 };
+    const capturedAgent = Number(captured.agent || 0);
+    const capturedBackground = Number(captured.background || 0);
+
+    this.openStore();
+    if (!this.store) {
+      return {
+        available: false,
+        expected: null,
+        capturedAgent,
+        capturedBackground,
+        missing: 0,
+        subAgents: null,
+      };
+    }
+    try {
+      const row = this.store
+        .prepare('SELECT COUNT(*) AS n FROM assistant_usage_events WHERE session_id = ?')
+        .get(sessionId);
+      const subs = this.store
+        .prepare(
+          `SELECT COUNT(DISTINCT agent_id) AS n FROM assistant_usage_events
+           WHERE session_id = ? AND agent_id IS NOT NULL`
+        )
+        .get(sessionId);
+      const expected = Number(row ? row.n : 0);
+      return {
+        available: true,
+        expected,
+        capturedAgent,
+        capturedBackground,
+        missing: Math.max(0, expected - capturedAgent),
+        extra: Math.max(0, capturedAgent - expected),
+        subAgents: Number(subs ? subs.n : 0),
+      };
+    } catch {
+      return {
+        available: false,
+        expected: null,
+        capturedAgent,
+        capturedBackground,
+        missing: 0,
+        subAgents: null,
+      };
+    }
+  }
+
   listSessions() {
     const rows = this.db
       .prepare(
@@ -119,18 +180,59 @@ export class Db {
          ORDER BY cs.started_at DESC`
       )
       .all();
-    return rows.map((r) => ({ ...r, ...this.enrichment(r.session_id) }));
+    return rows.map((r) => ({
+      ...r,
+      ...this.enrichment(r.session_id),
+      verification: this.verification(r.session_id),
+    }));
   }
 
   listContexts(sessionId) {
-    return this.db
+    // Derive display labels at read time from each context's interaction type so a background
+    // title/summary call can never be mislabeled as the main agent. Ordering follows first capture.
+    const rows = this.db
       .prepare(
-        `SELECT c.context_id, c.session_id, c.label, c.agent_id, c.first_seen_at,
-                (SELECT COUNT(*) FROM turns t WHERE t.context_id = c.context_id) AS turn_count
+        `SELECT c.context_id, c.session_id, c.agent_id, c.first_seen_at, c.thread_key,
+                (SELECT COUNT(*) FROM turns t WHERE t.context_id = c.context_id) AS turn_count,
+                (SELECT COUNT(*) FROM turns t WHERE t.context_id = c.context_id
+                   AND IFNULL(json_extract(t.request_headers_json,'$."x-interaction-type"'),'')
+                       LIKE '%background%') AS background_turns,
+                (SELECT json_extract(t.request_headers_json,'$."x-interaction-type"')
+                   FROM turns t WHERE t.context_id = c.context_id
+                   ORDER BY t.turn_index DESC LIMIT 1) AS interaction_type
          FROM contexts c WHERE c.session_id = ?
          ORDER BY c.context_id ASC`
       )
       .all(sessionId);
+
+    let agentIndex = 0;
+    return rows.map((r) => {
+      const isBackground = r.turn_count > 0 && r.background_turns === r.turn_count;
+      let kind;
+      let label;
+      if (isBackground) {
+        kind = 'background';
+        label = 'Background (title/summary)';
+      } else if (agentIndex === 0) {
+        kind = 'main';
+        label = 'Main agent';
+        agentIndex += 1;
+      } else {
+        kind = 'sub';
+        label = `Sub-agent ${agentIndex}`;
+        agentIndex += 1;
+      }
+      return {
+        context_id: r.context_id,
+        session_id: r.session_id,
+        label,
+        kind,
+        interaction_type: r.interaction_type,
+        agent_id: r.agent_id,
+        first_seen_at: r.first_seen_at,
+        turn_count: r.turn_count,
+      };
+    });
   }
 
   // Lightweight list for diffing: canonical prompt text + a little metadata per turn.

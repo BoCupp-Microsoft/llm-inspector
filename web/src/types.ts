@@ -1,3 +1,13 @@
+export interface Verification {
+  available: boolean;
+  expected: number | null;
+  capturedAgent: number;
+  capturedBackground: number;
+  missing: number;
+  extra?: number;
+  subAgents: number | null;
+}
+
 export interface SessionRow {
   session_id: string;
   status: string | null;
@@ -12,12 +22,15 @@ export interface SessionRow {
   summary: string | null;
   repository: string | null;
   branch: string | null;
+  verification?: Verification;
 }
 
 export interface ContextRow {
   context_id: number;
   session_id: string;
   label: string | null;
+  kind?: 'main' | 'sub' | 'background';
+  interaction_type?: string | null;
   agent_id: string | null;
   first_seen_at: string | null;
   turn_count: number;
