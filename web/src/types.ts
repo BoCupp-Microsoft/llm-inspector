@@ -11,6 +11,10 @@ export interface Verification {
 export interface SessionRow {
   session_id: string;
   status: string | null;
+  stored_status?: string | null;
+  live?: boolean;
+  stale?: boolean;
+  status_reason?: string;
   started_at: string | null;
   ended_at: string | null;
   cwd: string | null;
@@ -22,6 +26,7 @@ export interface SessionRow {
   summary: string | null;
   repository: string | null;
   branch: string | null;
+  updatedAt?: string | null;
   verification?: Verification;
 }
 

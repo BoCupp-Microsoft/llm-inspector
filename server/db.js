@@ -72,6 +72,19 @@ function ensureColumns(db, table, columns) {
   }
 }
 
+// Is a process still running? signal 0 performs an existence/permission check without delivering a
+// signal. ESRCH => gone; EPERM => exists but owned by another user (still alive). Returns null when
+// there is no pid to check.
+function pidAlive(pid) {
+  if (!pid) return null;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
 export class Db {
   constructor(tracerPath, sessionStorePath) {
     this.tracerPath = tracerPath;
@@ -99,7 +112,7 @@ export class Db {
   // Per-session AIC + token rollups from the Copilot session store (best-effort).
   enrichment(sessionId) {
     this.openStore();
-    const empty = { aic: null, inputTokens: null, outputTokens: null, summary: null, repository: null, branch: null };
+    const empty = { aic: null, inputTokens: null, outputTokens: null, summary: null, repository: null, branch: null, updatedAt: null };
     if (!this.store) return empty;
     try {
       const usage = this.store
@@ -110,7 +123,7 @@ export class Db {
         )
         .get(sessionId);
       const meta = this.store
-        .prepare('SELECT summary, repository, branch FROM sessions WHERE id = ?')
+        .prepare('SELECT summary, repository, branch, updated_at FROM sessions WHERE id = ?')
         .get(sessionId) || {};
       return {
         aic: usage ? Number(usage.nano) / 1e9 : null,
@@ -119,10 +132,50 @@ export class Db {
         summary: meta.summary ?? null,
         repository: meta.repository ?? null,
         branch: meta.branch ?? null,
+        updatedAt: meta.updated_at ?? null,
       };
     } catch (err) {
       return empty;
     }
+  }
+
+  // A capture row's stored status only reaches 'ended' if the launcher saw the copilot process exit;
+  // a force-close or a killed launcher leaves a row stuck on 'live' forever. Derive the *effective*
+  // status at read time from ground truth: (1) is the launched copilot PID still alive, and
+  // (2) how recently did Copilot's own session store record activity. Returns the display status plus
+  // a `live` flag, a `stale` flag (true when we overrode a 'live' row we believe is actually over),
+  // and a human-readable reason for the tooltip.
+  effectiveStatus(row, updatedAt) {
+    if (row.ended_at || row.status === 'ended') {
+      return { status: 'ended', live: false, stale: false, reason: 'closed (marked by launcher)' };
+    }
+    const ageMin = updatedAt ? (Date.now() - Date.parse(updatedAt)) / 60000 : null;
+    const alive = pidAlive(row.copilot_pid);
+    if (alive === true) {
+      // Guard against PID reuse: a genuinely live session keeps its store fresh; a very stale store
+      // with a "live" PID means the original copilot exited and the PID was recycled.
+      if (ageMin != null && ageMin > 720) {
+        return {
+          status: 'ended', live: false, stale: true,
+          reason: `PID ${row.copilot_pid} is alive but Copilot recorded no activity for ${Math.round(ageMin)}m (PID likely reused)`,
+        };
+      }
+      return { status: 'live', live: true, stale: false, reason: 'copilot process running' };
+    }
+    if (alive === false) {
+      return {
+        status: 'ended', live: false, stale: true,
+        reason: `copilot PID ${row.copilot_pid} has exited (never marked ended)`,
+      };
+    }
+    // No PID recorded (e.g. session seen only by the addon): fall back to store activity staleness.
+    if (ageMin != null) {
+      if (ageMin > 10) {
+        return { status: 'ended', live: false, stale: true, reason: `no Copilot activity for ${Math.round(ageMin)}m` };
+      }
+      return { status: 'live', live: true, stale: false, reason: 'recent Copilot activity' };
+    }
+    return { status: row.status || 'unknown', live: row.status === 'live', stale: false, reason: 'no liveness signal available' };
   }
 
   // Distinct *real* sub-agent ids for a session, straight from the Copilot store. The store's
@@ -290,7 +343,7 @@ export class Db {
   listSessions() {
     const rows = this.db
       .prepare(
-        `SELECT cs.session_id, cs.status, cs.started_at, cs.ended_at, cs.cwd,
+        `SELECT cs.session_id, cs.status, cs.started_at, cs.ended_at, cs.cwd, cs.copilot_pid,
                 COUNT(DISTINCT c.context_id) AS context_count,
                 (SELECT COUNT(*) FROM turns t WHERE t.session_id = cs.session_id) AS turn_count
          FROM capture_sessions cs
@@ -299,14 +352,24 @@ export class Db {
          ORDER BY cs.started_at DESC`
       )
       .all();
-    return rows.map((r) => ({
-      ...r,
-      // Report the display-context count (merged main + backgrounds), matching what listContexts
-      // returns, rather than the raw captured-thread count.
-      context_count: this.contextGroups(r.session_id).length,
-      ...this.enrichment(r.session_id),
-      verification: this.verification(r.session_id),
-    }));
+    return rows.map((r) => {
+      const enr = this.enrichment(r.session_id);
+      const eff = this.effectiveStatus(r, enr.updatedAt);
+      return {
+        ...r,
+        // Report the display-context count (merged main + backgrounds), matching what listContexts
+        // returns, rather than the raw captured-thread count.
+        context_count: this.contextGroups(r.session_id).length,
+        ...enr,
+        verification: this.verification(r.session_id),
+        // Effective (read-time) liveness overrides the stored status, which can be stuck on 'live'.
+        status: eff.status,
+        stored_status: r.status,
+        live: eff.live,
+        stale: eff.stale,
+        status_reason: eff.reason,
+      };
+    });
   }
 
   listContexts(sessionId) {
@@ -355,14 +418,22 @@ export class Db {
     return this.db.prepare('SELECT * FROM turns WHERE id = ?').get(id);
   }
 
-  // A cheap fingerprint of DB state used to detect changes for WS push.
+  // A cheap fingerprint of DB state used to detect changes for WS push. Includes the liveness of any
+  // session still stored as 'live' so that a copilot process simply exiting (with no further DB write)
+  // still flips the fingerprint and pushes the live -> ended transition to open viewers.
   state() {
     const t = this.db.prepare('SELECT COALESCE(MAX(id),0) AS m, COUNT(*) AS n FROM turns').get();
     const c = this.db.prepare('SELECT COALESCE(MAX(context_id),0) AS m FROM contexts').get();
     const s = this.db
       .prepare("SELECT COUNT(*) AS n, COALESCE(GROUP_CONCAT(status),'') AS st FROM capture_sessions")
       .get();
-    return `${t.m}:${t.n}:${c.m}:${s.n}:${s.st}`;
+    const liveRows = this.db
+      .prepare("SELECT session_id, copilot_pid FROM capture_sessions WHERE status = 'live'")
+      .all();
+    const liveness = liveRows
+      .map((r) => `${r.session_id.slice(0, 8)}=${pidAlive(r.copilot_pid) ? 1 : 0}`)
+      .join(',');
+    return `${t.m}:${t.n}:${c.m}:${s.n}:${s.st}:${liveness}`;
   }
 
   runReadOnly(sql) {

@@ -46,7 +46,12 @@ export function SessionList({
                 {subAgents > 0 && (
                   <span className="sub-badge" title={subInfo}>⛓ {subAgents} sub</span>
                 )}
-                <span className={`status status-${s.status || 'unknown'}`}>{s.status || '—'}</span>
+                <span
+                  className={`status status-${s.status || 'unknown'}${s.stale ? ' status-inferred' : ''}`}
+                  title={s.status_reason || undefined}
+                >
+                  {s.status || '—'}{s.stale ? ' •' : ''}
+                </span>
               </div>
               <div className="row-sub session-id" title={s.session_id}>{s.session_id}</div>
               <div className="row-meta">
