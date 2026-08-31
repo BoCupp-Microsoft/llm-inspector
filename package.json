@@ -16,10 +16,11 @@
     "test": "node --test tests/capture.test.mjs",
     "test:diff": "node --test tests/diff.test.mjs",
     "test:contexts": "node --test tests/contexts.test.mjs",
-    "test:unit": "node --test tests/diff.test.mjs tests/contexts.test.mjs tests/session-status.test.mjs",
+    "test:unit": "node --test tests/diff.test.mjs tests/contexts.test.mjs tests/session-status.test.mjs tests/evolution-model.test.mjs",
     "test:addon": "python mitm/test_addon.py",
     "test:capture": "node --test tests/capture.test.mjs",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test --project=e2e",
+    "test:perf": "playwright test --project=perf"
   },
   "dependencies": {
     "react": "^19.0.0",
